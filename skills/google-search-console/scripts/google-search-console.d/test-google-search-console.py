@@ -98,10 +98,19 @@ class SearchConsoleTest(unittest.TestCase):
             "GOOGLE_SEARCH_CONSOLE_EXAMPLE_REFRESH_TOKEN": "legacy-refresh",
         }
         with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(self.module.SearchConsoleError, "both Rundesk suffix and legacy"):
+                self.module.get_profile("example")
+
+    def test_missing_legacy_credential_uses_the_legacy_variable_name(self):
+        env = {
+            "GOOGLE_SEARCH_CONSOLE_EXAMPLE_CLIENT_ID": "legacy-client",
+            "GOOGLE_SEARCH_CONSOLE_EXAMPLE_CLIENT_SECRET": "legacy-secret",
+        }
+        with patch.dict(os.environ, env, clear=True):
             with self.assertRaises(self.module.SearchConsoleError) as raised:
                 self.module.get_profile("example")
-        self.assertIn("CLIENT_SECRET__EXAMPLE", str(raised.exception))
-        self.assertNotIn("legacy-secret", str(raised.exception))
+        self.assertIn("GOOGLE_SEARCH_CONSOLE_EXAMPLE_REFRESH_TOKEN", str(raised.exception))
+        self.assertNotIn("REFRESH_TOKEN__EXAMPLE", str(raised.exception))
 
     def test_plain_credentials_create_default_profile(self):
         env = {

@@ -25,7 +25,7 @@ must match `^[A-Z][A-Z0-9_]*$` and cannot contain `__`. A named profile never fa
 value because that could combine credentials from different Google identities or OAuth clients.
 Likewise, a profile is resolved entirely from Rundesk's suffix form or entirely from a package's
 documented legacy infix form. A partial profile in one form is reported as incomplete; fields from
-the other form never fill its gaps.
+the other form never fill its gaps. A profile configured in both forms is ambiguous and refused.
 
 Commands resolve configuration in this order:
 

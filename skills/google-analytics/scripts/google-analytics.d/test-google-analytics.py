@@ -112,10 +112,19 @@ class GoogleAnalyticsTest(unittest.TestCase):
             "GOOGLE_ANALYTICS_EXAMPLE_REFRESH_TOKEN": "legacy-refresh",
         }
         with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(self.module.AnalyticsError, "both Rundesk suffix and legacy"):
+                self.module.get_profile("example")
+
+    def test_missing_legacy_credential_uses_the_legacy_variable_name(self):
+        env = {
+            "GOOGLE_ANALYTICS_EXAMPLE_CLIENT_ID": "legacy-client",
+            "GOOGLE_ANALYTICS_EXAMPLE_CLIENT_SECRET": "legacy-secret",
+        }
+        with patch.dict(os.environ, env, clear=True):
             with self.assertRaises(self.module.AnalyticsError) as raised:
                 self.module.get_profile("example")
-        self.assertIn("CLIENT_SECRET__EXAMPLE", str(raised.exception))
-        self.assertNotIn("legacy-secret", str(raised.exception))
+        self.assertIn("GOOGLE_ANALYTICS_EXAMPLE_REFRESH_TOKEN", str(raised.exception))
+        self.assertNotIn("REFRESH_TOKEN__EXAMPLE", str(raised.exception))
 
     def test_dotenv_does_not_replace_process_environment(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -355,6 +364,12 @@ class GoogleAnalyticsTest(unittest.TestCase):
                 args = SimpleNamespace(start_time=start, end_time=end, days=7)
                 with self.assertRaisesRegex(self.module.AnalyticsError, "RFC 3339|timezone"):
                     self.module.change_interval(args)
+
+    def test_change_interval_accepts_nanosecond_rfc3339_on_python_39(self):
+        start = "2026-08-01T00:00:00.123456789Z"
+        end = "2026-08-02T00:00:00.987654321Z"
+        args = SimpleNamespace(start_time=start, end_time=end, days=7)
+        self.assertEqual((start, end), self.module.change_interval(args))
 
     def test_launcher_help_resolves_outside_repository(self):
         completed = subprocess.run(

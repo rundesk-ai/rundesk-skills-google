@@ -106,6 +106,25 @@ def is_default(name: str) -> bool:
     return normalized in ("", "DEFAULT")
 
 
+def profile_form(name: str) -> str:
+    if is_default(name):
+        return "plain"
+    suffix = normalize(name)
+    has_suffix = any(os.environ.get(f"{field}__{suffix}") for field in REQUIRED)
+    has_legacy = any(
+        os.environ.get(f"{SKILL}_{suffix}_{FIELDS[field]}") for field in REQUIRED
+    )
+    if has_suffix and has_legacy:
+        raise SearchConsoleError(
+            f"Profile {name!r} is configured in both Rundesk suffix and legacy infix forms; remove one form."
+        )
+    if has_suffix:
+        return "suffix"
+    if has_legacy:
+        return "legacy"
+    return "none"
+
+
 def profile_value(name: str, field: str) -> str:
     suffix = normalize(name)
     if field not in REQUIRED:
@@ -116,19 +135,21 @@ def profile_value(name: str, field: str) -> str:
         return os.environ.get(field, "") if is_default(name) else ""
     if is_default(name):
         return os.environ.get(field, "")
-    suffix_id = f"{REQUIRED[0]}__{suffix}"
-    legacy_id = f"{SKILL}_{suffix}_{FIELDS[REQUIRED[0]]}"
-    has_suffix_form = bool(os.environ.get(suffix_id)) or any(
-        os.environ.get(f"{required}__{suffix}") for required in REQUIRED
-    )
-    has_legacy_form = bool(os.environ.get(legacy_id)) or any(
-        os.environ.get(f"{SKILL}_{suffix}_{FIELDS[required]}") for required in REQUIRED
-    )
-    if has_suffix_form:
+    form = profile_form(name)
+    if form == "suffix":
         return os.environ.get(f"{field}__{suffix}", "")
-    if has_legacy_form:
+    if form == "legacy":
         return os.environ.get(f"{SKILL}_{suffix}_{FIELDS[field]}", "")
     return ""
+
+
+def missing_name(name: str, field: str) -> str:
+    if is_default(name):
+        return field
+    suffix = normalize(name)
+    if profile_form(name) == "legacy":
+        return f"{SKILL}_{suffix}_{FIELDS[field]}"
+    return f"{field}__{suffix}"
 
 
 def discovered_profiles() -> list[str]:
@@ -160,7 +181,7 @@ def get_profile(name: str) -> Profile:
     if name and not normalize(name):
         raise SearchConsoleError("Profile names must contain at least one letter or digit.")
     values = {field: profile_value(name, field) for field in FIELDS}
-    missing = [field if is_default(name) else f"{field}__{normalize(name)}" for field in REQUIRED if not values[field]]
+    missing = [missing_name(name, field) for field in REQUIRED if not values[field]]
     if missing:
         raise SearchConsoleError("Missing required configuration: " + ", ".join(missing) + ". Run rundesk skills configure for this skill.")
     return Profile(name, values[REQUIRED[0]], values[REQUIRED[1]], values[REQUIRED[2]], values["GOOGLE_SEARCH_CONSOLE_LABEL"] or name)

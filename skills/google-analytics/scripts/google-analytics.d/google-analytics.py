@@ -119,6 +119,26 @@ def is_default_profile(name: str) -> bool:
     return name in ("", "default")
 
 
+def profile_form(name: str) -> str:
+    if is_default_profile(name):
+        return "plain"
+    suffix = profile_suffix(name)
+    has_suffix = any(os.environ.get(f"{field}__{suffix}") for field in REQUIRED_FIELDS)
+    has_legacy = any(
+        os.environ.get(f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[field]}")
+        for field in REQUIRED_FIELDS
+    )
+    if has_suffix and has_legacy:
+        raise AnalyticsError(
+            f"Profile {name!r} is configured in both Rundesk suffix and legacy infix forms; remove one form."
+        )
+    if has_suffix:
+        return "suffix"
+    if has_legacy:
+        return "legacy"
+    return "none"
+
+
 def profile_value(name: str, field: str) -> str:
     suffix = profile_suffix(name)
     if field not in REQUIRED_FIELDS:
@@ -132,24 +152,21 @@ def profile_value(name: str, field: str) -> str:
         return os.environ.get(field, "") if is_default_profile(name) else ""
     if is_default_profile(name):
         return os.environ.get(field, "")
-    suffix_id = f"{REQUIRED_FIELDS[0]}__{suffix}"
-    legacy_id = f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[REQUIRED_FIELDS[0]]}"
-    has_suffix_form = bool(os.environ.get(suffix_id)) or any(
-        os.environ.get(f"{required}__{suffix}") for required in REQUIRED_FIELDS
-    )
-    has_legacy_form = bool(os.environ.get(legacy_id)) or any(
-        os.environ.get(f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[required]}")
-        for required in REQUIRED_FIELDS
-    )
-    if has_suffix_form:
+    form = profile_form(name)
+    if form == "suffix":
         return os.environ.get(f"{field}__{suffix}", "")
-    if has_legacy_form:
+    if form == "legacy":
         return os.environ.get(f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[field]}", "")
     return ""
 
 
 def missing_name(name: str, field: str) -> str:
-    return field if is_default_profile(name) else f"{field}__{profile_suffix(name)}"
+    if is_default_profile(name):
+        return field
+    suffix = profile_suffix(name)
+    if profile_form(name) == "legacy":
+        return f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[field]}"
+    return f"{field}__{suffix}"
 
 
 def configured_profile_names() -> List[str]:
@@ -509,8 +526,14 @@ def change_interval(args: argparse.Namespace) -> Tuple[str, str]:
         raise AnalyticsError("Pass both --start-time and --end-time, or neither.")
     if args.start_time:
         for value in (args.start_time, args.end_time):
+            if not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+                value,
+            ):
+                raise AnalyticsError("Change-history times must use RFC 3339.")
+            normalized = re.sub(r"(\.\d{6})\d+", r"\1", value).replace("Z", "+00:00")
             try:
-                parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                parsed = dt.datetime.fromisoformat(normalized)
             except ValueError as exc:
                 raise AnalyticsError("Change-history times must use RFC 3339.") from exc
             if parsed.tzinfo is None:
