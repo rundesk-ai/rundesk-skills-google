@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
@@ -90,6 +91,18 @@ class SearchConsoleTest(unittest.TestCase):
             with self.assertRaisesRegex(self.module.SearchConsoleError, "letter or digit"):
                 self.module.get_profile("---")
 
+    def test_profile_credentials_never_mix_rundesk_and_legacy_forms(self):
+        env = {
+            "GOOGLE_SEARCH_CONSOLE_CLIENT_ID__EXAMPLE": "suffix-client",
+            "GOOGLE_SEARCH_CONSOLE_EXAMPLE_CLIENT_SECRET": "legacy-secret",
+            "GOOGLE_SEARCH_CONSOLE_EXAMPLE_REFRESH_TOKEN": "legacy-refresh",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(self.module.SearchConsoleError) as raised:
+                self.module.get_profile("example")
+        self.assertIn("CLIENT_SECRET__EXAMPLE", str(raised.exception))
+        self.assertNotIn("legacy-secret", str(raised.exception))
+
     def test_plain_credentials_create_default_profile(self):
         env = {
             "GOOGLE_SEARCH_CONSOLE_CLIENT_ID": "client",
@@ -99,6 +112,27 @@ class SearchConsoleTest(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(self.module.discovered_profiles(), ["default"])
             self.assertEqual(self.module.get_profile("default").client_id, "client")
+
+    def test_dotenv_preserves_unmatched_quotes_and_rejects_invalid_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "env"
+            path.write_text(
+                "GOOGLE_SEARCH_CONSOLE_CLIENT_ID=value'\n"
+                "export GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET=ignored\n",
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            with patch.dict(os.environ, {}, clear=True):
+                self.module.load_dotenv(path)
+                self.assertEqual(os.environ["GOOGLE_SEARCH_CONSOLE_CLIENT_ID"], "value'")
+                self.assertNotIn("export GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET", os.environ)
+
+    def test_explicit_missing_env_file_is_refused(self):
+        missing = "/tmp/rundesk-google-search-console-does-not-exist"
+        with patch.dict(os.environ, {}, clear=True), redirect_stderr(io.StringIO()) as error:
+            code = self.module.main(["profiles", "--env-file", missing])
+        self.assertEqual(code, 2)
+        self.assertIn("does not exist", error.getvalue())
 
     def test_token_refresh_posts_credentials_without_printing_them(self):
         requests = []
@@ -112,6 +146,7 @@ class SearchConsoleTest(unittest.TestCase):
         body = request.data.decode()
         self.assertIn("client_id=client", body)
         self.assertIn("refresh_token=refresh", body)
+        self.assertNotIn("secret", repr(self.profile))
 
     def test_request_error_exposes_google_message_but_not_authorization(self):
         error = urllib.error.HTTPError(

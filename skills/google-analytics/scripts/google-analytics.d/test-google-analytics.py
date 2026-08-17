@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parent / "google-analytics.py"
+LAUNCHER = SCRIPT.parent.parent / "google-analytics"
 
 
 def load_module():
@@ -103,6 +105,18 @@ class GoogleAnalyticsTest(unittest.TestCase):
             with self.assertRaises(self.module.AnalyticsError):
                 self.module.get_profile("example")
 
+    def test_profile_credentials_never_mix_rundesk_and_legacy_forms(self):
+        env = {
+            "GOOGLE_ANALYTICS_CLIENT_ID__EXAMPLE": "suffix-client",
+            "GOOGLE_ANALYTICS_EXAMPLE_CLIENT_SECRET": "legacy-secret",
+            "GOOGLE_ANALYTICS_EXAMPLE_REFRESH_TOKEN": "legacy-refresh",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(self.module.AnalyticsError) as raised:
+                self.module.get_profile("example")
+        self.assertIn("CLIENT_SECRET__EXAMPLE", str(raised.exception))
+        self.assertNotIn("legacy-secret", str(raised.exception))
+
     def test_dotenv_does_not_replace_process_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "env"
@@ -122,6 +136,13 @@ class GoogleAnalyticsTest(unittest.TestCase):
                 self.module.load_dotenv(path)
         self.assertIn("chmod 600", errors.getvalue())
 
+    def test_explicit_missing_env_file_is_refused(self):
+        missing = "/tmp/rundesk-google-analytics-does-not-exist"
+        with patch.dict(os.environ, {}, clear=True), redirect_stderr(io.StringIO()) as error:
+            code = self.module.main(["profiles", "--env-file", missing])
+        self.assertEqual(code, 2)
+        self.assertIn("does not exist", error.getvalue())
+
     def test_refresh_access_token_posts_oauth_form(self):
         captured = {}
 
@@ -135,6 +156,7 @@ class GoogleAnalyticsTest(unittest.TestCase):
         self.assertEqual(token, "access")
         self.assertEqual(captured["url"], self.module.TOKEN_URL)
         self.assertIn("refresh_token=refresh", captured["body"])
+        self.assertNotIn("secret", repr(self.profile))
 
     def test_api_request_refuses_unexpected_origin(self):
         with self.assertRaises(self.module.AnalyticsError):
@@ -193,6 +215,14 @@ class GoogleAnalyticsTest(unittest.TestCase):
         self.assertEqual([row["account"] for row in rows], ["accounts/1", "accounts/2"])
         self.assertTrue(truncated)
         self.assertEqual(calls[1]["pageToken"], "next")
+
+    def test_account_summaries_stops_on_an_empty_page_with_a_token(self):
+        response = {"accountSummaries": [], "nextPageToken": "next"}
+        with patch.object(self.module, "api_request", return_value=response) as request:
+            rows, truncated = self.module.account_summaries("token", 5)
+        self.assertEqual([], rows)
+        self.assertTrue(truncated)
+        request.assert_called_once()
 
     def test_accounts_emits_normalized_rows(self):
         args = SimpleNamespace(profile="example", limit=25, json=True)
@@ -255,6 +285,19 @@ class GoogleAnalyticsTest(unittest.TestCase):
         self.assertEqual(captured["payload"]["limit"], "25")
         self.assertEqual(json.loads(output.getvalue())[0]["sessions"], "12")
 
+    def test_report_refuses_an_invalid_row_count(self):
+        args = SimpleNamespace(
+            profile="example", property="123", start_date="28daysAgo", end_date="today",
+            metrics="sessions", dimensions="date", limit=2, json=False,
+        )
+        with patch.object(self.module, "get_profile", return_value=self.profile), patch.object(
+            self.module, "refresh_access_token", return_value="token"
+        ), patch.object(
+            self.module, "api_request", return_value={"rows": [], "rowCount": None}
+        ), redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(self.module.AnalyticsError, "invalid row count"):
+                self.module.command_report(args)
+
     def test_realtime_uses_realtime_endpoint(self):
         args = SimpleNamespace(profile="example", property="456", metrics="activeUsers", dimensions="", limit=10, json=True)
         captured = {}
@@ -301,6 +344,25 @@ class GoogleAnalyticsTest(unittest.TestCase):
         args = SimpleNamespace(start_time="2026-08-01T00:00:00Z", end_time=None, days=7)
         with self.assertRaises(self.module.AnalyticsError):
             self.module.change_interval(args)
+
+    def test_change_interval_requires_rfc3339_with_timezone(self):
+        cases = (
+            ("not-a-time", "also-bad"),
+            ("2026-08-01T00:00:00", "2026-08-02T00:00:00"),
+        )
+        for start, end in cases:
+            with self.subTest(start=start):
+                args = SimpleNamespace(start_time=start, end_time=end, days=7)
+                with self.assertRaisesRegex(self.module.AnalyticsError, "RFC 3339|timezone"):
+                    self.module.change_interval(args)
+
+    def test_launcher_help_resolves_outside_repository(self):
+        completed = subprocess.run(
+            [str(LAUNCHER), "--help"], cwd="/tmp", env={"PATH": os.environ.get("PATH", "")},
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Google Analytics", completed.stdout)
 
 
 if __name__ == "__main__":

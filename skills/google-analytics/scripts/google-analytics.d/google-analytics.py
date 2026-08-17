@@ -15,7 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -23,6 +23,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 ADMIN_BASE = "https://analyticsadmin.googleapis.com/v1beta"
 DATA_BASE = "https://analyticsdata.googleapis.com/v1beta"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
+ACCOUNT_SUFFIX_RE = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)*")
+MAX_PAGES = 100
 REQUIRED_FIELDS = (
     "GOOGLE_ANALYTICS_CLIENT_ID",
     "GOOGLE_ANALYTICS_CLIENT_SECRET",
@@ -43,9 +45,9 @@ class AnalyticsError(RuntimeError):
 @dataclass(frozen=True)
 class Profile:
     name: str
-    client_id: str
-    client_secret: str
-    refresh_token: str
+    client_id: str = field(repr=False)
+    client_secret: str = field(repr=False)
+    refresh_token: str = field(repr=False)
     label: str
 
 
@@ -61,13 +63,19 @@ def split_csv(value: str) -> List[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
-def load_dotenv(path: Path) -> None:
+def load_dotenv(path: Path, *, required: bool = False) -> None:
     if not path.exists():
+        if required:
+            raise AnalyticsError(f"Environment file does not exist: {path}")
         return
-    mode = stat.S_IMODE(path.stat().st_mode)
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise AnalyticsError(f"Cannot read environment file {path}: {exc.strerror or exc}") from exc
     if mode & 0o077:
         print(f"WARNING: {path} is readable beyond its owner; run `chmod 600 {path}`.", file=sys.stderr)
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -98,6 +106,9 @@ def default_env_paths(explicit: Optional[str]) -> List[Path]:
 
 
 def load_environment(explicit: Optional[str]) -> None:
+    if explicit:
+        load_dotenv(Path(explicit).expanduser(), required=True)
+        return
     for path in default_env_paths(explicit):
         if path.exists():
             load_dotenv(path)
@@ -110,16 +121,30 @@ def is_default_profile(name: str) -> bool:
 
 def profile_value(name: str, field: str) -> str:
     suffix = profile_suffix(name)
-    if suffix:
-        value = os.environ.get(f"{field}__{suffix}", "")
-        if value:
-            return value
-        legacy = LEGACY_FIELDS[field]
-        value = os.environ.get(f"GOOGLE_ANALYTICS_{suffix}_{legacy}", "")
-        if value:
-            return value
+    if field not in REQUIRED_FIELDS:
+        if suffix:
+            for key in (
+                f"{field}__{suffix}",
+                f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[field]}",
+            ):
+                if os.environ.get(key):
+                    return os.environ[key]
+        return os.environ.get(field, "") if is_default_profile(name) else ""
     if is_default_profile(name):
         return os.environ.get(field, "")
+    suffix_id = f"{REQUIRED_FIELDS[0]}__{suffix}"
+    legacy_id = f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[REQUIRED_FIELDS[0]]}"
+    has_suffix_form = bool(os.environ.get(suffix_id)) or any(
+        os.environ.get(f"{required}__{suffix}") for required in REQUIRED_FIELDS
+    )
+    has_legacy_form = bool(os.environ.get(legacy_id)) or any(
+        os.environ.get(f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[required]}")
+        for required in REQUIRED_FIELDS
+    )
+    if has_suffix_form:
+        return os.environ.get(f"{field}__{suffix}", "")
+    if has_legacy_form:
+        return os.environ.get(f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[field]}", "")
     return ""
 
 
@@ -139,7 +164,8 @@ def configured_profile_names() -> List[str]:
     for key in os.environ:
         for field in REQUIRED_FIELDS:
             prefix = field + "__"
-            if key.startswith(prefix):
+            candidate = key[len(prefix):] if key.startswith(prefix) else ""
+            if candidate and ACCOUNT_SUFFIX_RE.fullmatch(candidate):
                 suffixed.add(profile_label(key[len(prefix) :]))
         match = legacy_pattern.match(key)
         if match:
@@ -291,18 +317,29 @@ def account_summaries(token: str, limit: int) -> Tuple[List[Dict[str, Any]], boo
     rows: List[Dict[str, Any]] = []
     page_token = ""
     truncated = False
-    while len(rows) < limit:
+    seen_tokens = set()
+    for _ in range(MAX_PAGES):
         params: Dict[str, Any] = {"pageSize": min(200, limit - len(rows))}
         if page_token:
             params["pageToken"] = page_token
         response = api_request(token, "GET", f"{ADMIN_BASE}/accountSummaries", params=params)
-        rows.extend(response.get("accountSummaries", []))
-        page_token = str(response.get("nextPageToken", ""))
-        if not page_token:
-            break
-    if page_token:
-        truncated = True
-    return rows[:limit], truncated
+        page = response.get("accountSummaries", [])
+        remaining = limit - len(rows)
+        if len(page) > remaining:
+            truncated = True
+        rows.extend(page[:remaining])
+        next_token = str(response.get("nextPageToken", ""))
+        if len(rows) >= limit:
+            return rows, truncated or bool(next_token) or len(page) > remaining
+        if not next_token:
+            return rows, truncated
+        if not page:
+            return rows, True
+        if next_token in seen_tokens:
+            raise AnalyticsError("Google Analytics pagination did not advance.")
+        seen_tokens.add(next_token)
+        page_token = next_token
+    raise AnalyticsError(f"Google Analytics pagination exceeded {MAX_PAGES} pages.")
 
 
 def emit_csv(headers: Sequence[str], rows: Iterable[Sequence[Any]]) -> None:
@@ -319,6 +356,14 @@ def emit_json(value: Any) -> None:
 def warn_truncated(truncated: bool, limit: int) -> None:
     if truncated:
         print(f"WARNING: Results were truncated at --limit {limit}.", file=sys.stderr)
+
+
+def response_row_count(response: Dict[str, Any], returned: int) -> int:
+    value = response.get("rowCount", returned)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise AnalyticsError("Google Analytics returned an invalid row count.") from exc
 
 
 def command_profiles(args: argparse.Namespace) -> None:
@@ -384,8 +429,10 @@ def command_properties(args: argparse.Namespace) -> None:
     if args.json:
         emit_json(rows)
     else:
-        emit_csv(("property_id", "display_name", "property_type", "account_id", "profile"), ((r["property_id"], r["display_name"], r["property_type"], r["account_id"], r["profile"]) for r in rows))
-    warn_truncated(account_truncated or more_properties, limit)
+        emit_csv(("property_id", "display_name", "property_type", "parent", "account_id", "profile"), ((r["property_id"], r["display_name"], r["property_type"], r["parent"], r["account_id"], r["profile"]) for r in rows))
+    if account_truncated:
+        print("WARNING: Account discovery was truncated at 2000 accounts.", file=sys.stderr)
+    warn_truncated(more_properties, limit)
 
 
 def dimension_metric_names(args: argparse.Namespace) -> Tuple[List[str], List[str]]:
@@ -440,7 +487,7 @@ def command_report(args: argparse.Namespace) -> None:
     response = api_request(refresh_access_token(profile), "POST", f"{DATA_BASE}/properties/{property_id}:runReport", payload=payload)
     rows = normalized_report(response, dimensions, metrics, profile, property_id)
     emit_report(rows, dimensions, metrics, args)
-    warn_truncated(int(response.get("rowCount", len(rows))) > len(rows), limit)
+    warn_truncated(response_row_count(response, len(rows)) > len(rows), limit)
 
 
 def command_realtime(args: argparse.Namespace) -> None:
@@ -454,13 +501,20 @@ def command_realtime(args: argparse.Namespace) -> None:
     response = api_request(refresh_access_token(profile), "POST", f"{DATA_BASE}/properties/{property_id}:runRealtimeReport", payload=payload)
     rows = normalized_report(response, dimensions, metrics, profile, property_id)
     emit_report(rows, dimensions, metrics, args)
-    warn_truncated(int(response.get("rowCount", len(rows))) > len(rows), limit)
+    warn_truncated(response_row_count(response, len(rows)) > len(rows), limit)
 
 
 def change_interval(args: argparse.Namespace) -> Tuple[str, str]:
     if bool(args.start_time) != bool(args.end_time):
         raise AnalyticsError("Pass both --start-time and --end-time, or neither.")
     if args.start_time:
+        for value in (args.start_time, args.end_time):
+            try:
+                parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise AnalyticsError("Change-history times must use RFC 3339.") from exc
+            if parsed.tzinfo is None:
+                raise AnalyticsError("Change-history times must include a timezone.")
         return args.start_time, args.end_time
     end = dt.datetime.now(dt.timezone.utc)
     start = end - dt.timedelta(days=args.days)
@@ -509,16 +563,17 @@ def command_changes(args: argparse.Namespace) -> None:
 
 
 def add_profile_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--env-file", help="Load an explicit dotenv after existing process variables")
     parser.add_argument("--profile", help="Configured Google Analytics profile")
     parser.add_argument("--json", action="store_true", help="Emit normalized JSON")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="google-analytics", description="Read bounded Google Analytics 4 data.")
-    parser.add_argument("--env-file", help="Load an explicit dotenv after existing process variables")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     profiles = subparsers.add_parser("profiles", help="List configured profiles without a network request")
+    profiles.add_argument("--env-file", help="Load an explicit dotenv after existing process variables")
     profiles.add_argument("--json", action="store_true", help="Emit normalized JSON")
     profiles.set_defaults(handler=command_profiles)
 
@@ -568,8 +623,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    load_environment(args.env_file)
     try:
+        load_environment(args.env_file)
         args.handler(args)
     except AnalyticsError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -14,7 +14,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -40,9 +40,9 @@ class SearchConsoleError(RuntimeError):
 @dataclass(frozen=True)
 class Profile:
     name: str
-    client_id: str
-    client_secret: str
-    refresh_token: str
+    client_id: str = field(repr=False)
+    client_secret: str = field(repr=False)
+    refresh_token: str = field(repr=False)
     label: str
 
 
@@ -68,19 +68,29 @@ def resolve_env_file(explicit: str | None) -> Path:
     return env_candidates()[-1]
 
 
-def load_dotenv(path: Path) -> None:
+def load_dotenv(path: Path, *, required: bool = False) -> None:
     if not path.exists():
+        if required:
+            raise SearchConsoleError(f"Environment file does not exist: {path}")
         return
-    mode = path.stat().st_mode & 0o777
+    try:
+        mode = path.stat().st_mode & 0o777
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise SearchConsoleError(f"Cannot read environment file {path}: {exc.strerror or exc}") from exc
     if mode & 0o077:
         print(f"WARNING: dotenv file {path} is accessible by group or others; use chmod 600.", file=sys.stderr)
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        if key.strip() and key.strip() not in os.environ:
-            os.environ[key.strip()] = value.strip().strip('"').strip("'")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and key not in os.environ:
+            os.environ[key] = value
 
 
 def normalize(name: str) -> str:
@@ -98,11 +108,27 @@ def is_default(name: str) -> bool:
 
 def profile_value(name: str, field: str) -> str:
     suffix = normalize(name)
-    if suffix:
-        for key in (f"{field}__{suffix}", f"{SKILL}_{suffix}_{FIELDS[field]}"):
-            if os.environ.get(key):
-                return os.environ[key]
-    return os.environ.get(field, "") if is_default(name) else ""
+    if field not in REQUIRED:
+        if suffix:
+            for key in (f"{field}__{suffix}", f"{SKILL}_{suffix}_{FIELDS[field]}"):
+                if os.environ.get(key):
+                    return os.environ[key]
+        return os.environ.get(field, "") if is_default(name) else ""
+    if is_default(name):
+        return os.environ.get(field, "")
+    suffix_id = f"{REQUIRED[0]}__{suffix}"
+    legacy_id = f"{SKILL}_{suffix}_{FIELDS[REQUIRED[0]]}"
+    has_suffix_form = bool(os.environ.get(suffix_id)) or any(
+        os.environ.get(f"{required}__{suffix}") for required in REQUIRED
+    )
+    has_legacy_form = bool(os.environ.get(legacy_id)) or any(
+        os.environ.get(f"{SKILL}_{suffix}_{FIELDS[required]}") for required in REQUIRED
+    )
+    if has_suffix_form:
+        return os.environ.get(f"{field}__{suffix}", "")
+    if has_legacy_form:
+        return os.environ.get(f"{SKILL}_{suffix}_{FIELDS[field]}", "")
+    return ""
 
 
 def discovered_profiles() -> list[str]:
@@ -334,7 +360,7 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = parser().parse_args(argv)
-        load_dotenv(resolve_env_file(args.env_file))
+        load_dotenv(resolve_env_file(args.env_file), required=bool(args.env_file))
         if hasattr(args, "limit") and not 1 <= args.limit <= 1000:
             raise SearchConsoleError("--limit must be between 1 and 1000.")
         if hasattr(args, "days") and not 1 <= args.days <= 480:
