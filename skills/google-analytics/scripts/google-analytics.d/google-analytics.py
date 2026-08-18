@@ -588,6 +588,9 @@ KEY_EVENT_METRICS = ("keyEvents", "eventCount", "activeUsers", "totalRevenue")
 ITEM_METRICS = ("itemsViewed", "itemsAddedToCart", "itemsCheckedOut", "itemsPurchased", "itemRevenue")
 PURCHASE_METRICS = ("ecommercePurchases", "purchaseRevenue", "totalRevenue")
 REVENUE_METRICS = frozenset({"totalRevenue", "purchaseRevenue", "itemRevenue"})
+DERIVED_METRIC_EXPRESSIONS = {
+    "averageEngagementTimePerSession": "userEngagementDuration/sessions",
+}
 
 # Acquisition dimensions are paired with an explicit scope because session-scoped and
 # first-user-scoped attribution answer different questions and are separate API names.
@@ -693,6 +696,18 @@ def validated_fields(dimensions: Sequence[str], metrics: Sequence[str]) -> None:
             raise AnalyticsError(f"Invalid Analytics field name: {value!r}.")
 
 
+def metric_requests(metrics: Sequence[str]) -> List[Dict[str, str]]:
+    """Build bounded metric fields, including Google's documented derived metrics."""
+    requests = []
+    for name in metrics:
+        metric = {"name": name}
+        expression = DERIVED_METRIC_EXPRESSIONS.get(name)
+        if expression is not None:
+            metric["expression"] = expression
+        requests.append(metric)
+    return requests
+
+
 def key_event_filter() -> Dict[str, Any]:
     """Restrict a report to events the property marks as key events."""
     return {"filter": {"fieldName": "isKeyEvent", "stringFilter": {"matchType": "EXACT", "value": "true"}}}
@@ -775,7 +790,7 @@ def run_breakdown_report(
             }
         ],
         "dimensions": [{"name": name} for name in dimensions],
-        "metrics": [{"name": name} for name in metrics],
+        "metrics": metric_requests(metrics),
         "orderBys": order_bys(breakdown),
         "limit": str(limit),
     }

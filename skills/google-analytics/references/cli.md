@@ -37,7 +37,8 @@ of the distribution, except a `date` breakdown, which sorts oldest day first.
 ## Bounded report fields
 
 `traffic` reports `sessions`, `activeUsers`, `newUsers`, `engagedSessions`, `engagementRate`,
-`averageEngagementTimePerSession`, `keyEvents`, and `totalRevenue`.
+`averageEngagementTimePerSession` (derived as `userEngagementDuration/sessions`), `keyEvents`, and
+`totalRevenue`.
 
 | `--breakdown` | `--scope session` | `--scope first-user` |
 |---|---|---|
