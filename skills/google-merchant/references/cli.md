@@ -22,6 +22,7 @@ google-merchant competitive-visibility --profile example --account 123456 \
 ```
 
 Every command accepts `--profile`, `--env-file`, `--json`, and, apart from `profiles`, `--limit`.
+Reports allow at most 5,000 rows, `accounts` allows 2,000, and `status` and `issues` allow 1,000.
 Every read is bounded by `--limit`; truncation is reported on stderr.
 
 ## Setup
@@ -168,7 +169,7 @@ Common causes: `PERMISSION_DENIED_TO_USE_MARKET_INSIGHTS` means the program is n
 account; `PERMISSION_DENIED_NOT_ALLOWLISTED_TO_USE_PERFORMANCE_REPORTING` means the identity lacks
 the performance and insights role; `INVALID_QUERY` means the query was rejected, which is a defect
 in this package rather than in the request. Retryable statuses are retried with backoff, honoring
-`Retry-After`.
+numeric `Retry-After` delays.
 
 ## Tests
 

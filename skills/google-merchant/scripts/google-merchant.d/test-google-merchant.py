@@ -96,6 +96,18 @@ class ProfileTest(unittest.TestCase):
         self.assertIn("GOOGLE_MERCHANT_CLIENT_SECRET__EXAMPLE", message)
         self.assertNotIn("plain-secret", message)
 
+    def test_unconfigured_named_profile_never_uses_a_complete_default_profile(self):
+        env = {
+            "GOOGLE_MERCHANT_CLIENT_ID": "plain-client",
+            "GOOGLE_MERCHANT_CLIENT_SECRET": "plain-secret",
+            "GOOGLE_MERCHANT_REFRESH_TOKEN": "plain-refresh",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(self.module.MerchantError) as raised:
+                self.module.get_profile("example")
+        self.assertIn("GOOGLE_MERCHANT_CLIENT_ID__EXAMPLE", str(raised.exception))
+        self.assertNotIn("plain-client", str(raised.exception))
+
     def test_a_profile_in_both_forms_is_refused_as_ambiguous(self):
         env = {
             "GOOGLE_MERCHANT_CLIENT_ID__EXAMPLE": "suffix",
@@ -124,6 +136,14 @@ class ProfileTest(unittest.TestCase):
                 self.module.load_dotenv(path)
             self.assertIn("readable beyond its owner", errors.getvalue())
             self.assertNotIn("abc", errors.getvalue())
+
+    def test_process_credentials_take_precedence_over_a_dotenv(self):
+        path = Path(self.enterContext_tempdir()) / "env"
+        path.write_text("GOOGLE_MERCHANT_CLIENT_ID=dotenv-client\n", encoding="utf-8")
+        path.chmod(0o600)
+        with patch.dict(os.environ, {"GOOGLE_MERCHANT_CLIENT_ID": "process-client"}, clear=True):
+            self.module.load_dotenv(path)
+            self.assertEqual("process-client", os.environ["GOOGLE_MERCHANT_CLIENT_ID"])
 
     def enterContext_tempdir(self):
         import tempfile
@@ -471,6 +491,7 @@ class TransportTest(unittest.TestCase):
             "https://evil.example/reports/v1/accounts/1/reports:search",
             "https://merchantapi.googleapis.com.evil.example/reports/v1/x",
             "https://merchantapi.googleapis.com/content/v2.1/x",
+            "https://merchantapi.googleapis.com/accounts/v1beta/accounts",
         ):
             with self.subTest(url=url):
                 with patch.object(self.module, "open_url", side_effect=AssertionError("network called")):
@@ -536,6 +557,25 @@ class TransportTest(unittest.TestCase):
             rows, _ = self.module.search_rows("token", "1", query, 10, "productView")
         self.assertEqual(3, len(rows))
 
+    def test_a_short_list_page_does_not_end_pagination(self):
+        pages = [
+            {"accounts": [{"accountId": "1"}], "nextPageToken": "t1"},
+            {"accounts": [{"accountId": "2"}]},
+        ]
+        calls = []
+
+        def fake_request(token, method, url, params=None, payload=None, retries=2):
+            calls.append(params)
+            return pages[len(calls) - 1]
+
+        with patch.object(self.module, "api_request", fake_request):
+            rows, truncated = self.module.list_rows(
+                "token", "https://x/y", "accounts", "account", 10, 500
+            )
+        self.assertEqual([{"accountId": "1"}, {"accountId": "2"}], rows)
+        self.assertFalse(truncated)
+        self.assertEqual("t1", calls[1]["pageToken"])
+
     def test_a_page_size_never_exceeds_googles_ceiling(self):
         sent = []
 
@@ -546,7 +586,7 @@ class TransportTest(unittest.TestCase):
         query = self.module.Query("product_view", ("id",))
         with patch.object(self.module, "api_request", fake_request):
             self.module.search_rows("token", "1", query, 5000, "productView")
-        self.assertEqual([self.module.MAX_PAGE_SIZE], sent)
+        self.assertEqual([1000], sent)
 
     def test_a_repeated_page_token_is_refused_instead_of_looping(self):
         def fake_request(token, method, url, params=None, payload=None, retries=2):
@@ -632,6 +672,18 @@ class TransportTest(unittest.TestCase):
             with self.assertRaises(self.module.MerchantError) as raised:
                 self.module.api_request("token", "GET", f"{self.module.ACCOUNTS_BASE}/accounts")
         self.assertIn("does not have access", str(raised.exception))
+
+    def test_an_oauth_failure_reports_googles_error_description(self):
+        body = {
+            "error": "invalid_grant",
+            "error_description": "Token has been expired or revoked.",
+        }
+        profile = self.module.Profile("example", "client", "secret", "refresh", "Example")
+        with patch.object(self.module, "open_url", side_effect=http_error(400, body)):
+            with self.assertRaises(self.module.MerchantError) as raised:
+                self.module.refresh_access_token(profile)
+        self.assertIn("expired or revoked", str(raised.exception))
+        self.assertNotIn("HTTP 400", str(raised.exception))
 
     def test_an_invalid_query_failure_reports_googles_message(self):
         body = {"error": {"code": 400, "message": "The query is invalid.", "status": "INVALID_ARGUMENT"}}
@@ -849,6 +901,47 @@ class OutputTest(unittest.TestCase):
                     reporting_context=None, country=None,
                 ))
         self.assertIn("productCount", str(raised.exception))
+
+    def test_an_omitted_issue_product_count_is_zero_and_does_not_hide_other_issues(self):
+        module = self.module
+        statuses = [{
+            "reportingContext": "SHOPPING_ADS",
+            "country": "US",
+            "itemLevelIssues": [
+                {"code": "zero", "severity": "NOT_IMPACTED"},
+                {"code": "large", "severity": "DISAPPROVED", "productCount": "42"},
+            ],
+        }]
+        output = io.StringIO()
+        with patch.object(module, "get_profile", lambda name: module.Profile("example", "c", "s", "r", "e")), \
+                patch.object(module, "refresh_access_token", lambda profile: "token"), \
+                patch.object(module, "list_rows", return_value=(statuses, False)), \
+                redirect_stdout(output), redirect_stderr(io.StringIO()):
+            module.command_issues(SimpleNamespace(
+                profile="example", account="123", limit=10, json=False,
+                reporting_context=None, country=None,
+            ))
+        lines = output.getvalue().strip().splitlines()
+        self.assertTrue(lines[1].startswith("large,DISAPPROVED,,42"))
+        self.assertTrue(lines[2].startswith("zero,NOT_IMPACTED,,0"))
+
+    def test_omitted_aggregate_counts_are_rendered_as_zero(self):
+        module = self.module
+        statuses = [{
+            "reportingContext": "SHOPPING_ADS",
+            "country": "US",
+            "stats": {"activeCount": "1500"},
+        }]
+        output = io.StringIO()
+        with patch.object(module, "get_profile", lambda name: module.Profile("example", "c", "s", "r", "e")), \
+                patch.object(module, "refresh_access_token", lambda profile: "token"), \
+                patch.object(module, "list_rows", return_value=(statuses, False)), \
+                redirect_stdout(output), redirect_stderr(io.StringIO()):
+            module.command_status(SimpleNamespace(
+                profile="example", account="123", limit=10, json=False,
+                reporting_context=None, country=None,
+            ))
+        self.assertIn("SHOPPING_ADS,US,1500,0,0,0,0,123,example", output.getvalue())
 
     def test_report_limit_uses_a_sentinel_row_and_warns(self):
         module = self.module
