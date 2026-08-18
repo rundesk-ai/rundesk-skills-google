@@ -324,6 +324,15 @@ class RequestContractTest(unittest.TestCase):
                 self.assertIn("clicks", query)
                 self.assertNotIn("*", query)
 
+    def test_custom_label_uses_the_published_merchant_field_name(self):
+        sent = self.capture(
+            self.module.command_performance,
+            self.base(breakdown="custom-label", during="LAST_30_DAYS", start_date=None,
+                      end_date=None, marketing_method=None, country=None, store_type=None),
+        )
+        self.assertIn("SELECT custom_label0, clicks", sent["payload"]["query"])
+        self.assertNotIn("custom_label_0", sent["payload"]["query"])
+
     def test_products_orders_by_click_potential_and_filters_by_context(self):
         sent = self.capture(
             self.module.command_products,
@@ -757,6 +766,7 @@ class OutputTest(unittest.TestCase):
         self.assertEqual("categoryL1", self.module.camel("category_l1"))
         self.assertEqual("clicks", self.module.camel("clicks"))
         self.assertEqual("productPerformanceView", self.module.camel("product_performance_view"))
+        self.assertEqual("customLabel0", self.module.camel("custom_label0"))
 
     def test_every_queried_view_maps_to_its_response_key(self):
         tables = ["product_performance_view", "product_view", "price_competitiveness_product_view",
