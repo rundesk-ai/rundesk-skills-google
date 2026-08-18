@@ -215,6 +215,9 @@ class PageSpeedTest(unittest.TestCase):
             ({"lighthouseResult": []}, "malformed Lighthouse result"),
             ({"lighthouseResult": "x"}, "malformed Lighthouse result"),
             ({}, "no Lighthouse result"),
+            (lighthouse(runtimeError=[]), "malformed Lighthouse runtime error"),
+            (lighthouse(runtimeError={"code": 7}), "malformed Lighthouse runtime error code"),
+            (lighthouse(runtimeError={"message": []}), "malformed Lighthouse runtime error message"),
             ({"lighthouseResult": {"categories": None}}, "malformed Lighthouse categories object"),
             ({"lighthouseResult": {"categories": []}}, "malformed Lighthouse categories object"),
             ({"lighthouseResult": {"audits": None}}, "malformed Lighthouse audits object"),
@@ -249,6 +252,21 @@ class PageSpeedTest(unittest.TestCase):
                 ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     with self.assertRaisesRegex(self.module.PageSpeedError, expected):
                         self.module.cmd_analyze(args)
+
+    def test_lighthouse_runtime_error_exits_two_without_success_output(self):
+        payload = lighthouse(runtimeError={
+            "code": "ERRORED_DOCUMENT_REQUEST",
+            "message": "Lighthouse was unable to reliably load the page.",
+        })
+        with patch.dict(os.environ, self.env, clear=True), patch.object(
+            self.module, "request_json", return_value=payload
+        ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+            code = self.module.main(["analyze", "--profile", "example", "--url", "https://example.test/"])
+        self.assertEqual(2, code)
+        self.assertEqual("", output.getvalue())
+        self.assertIn("ERRORED_DOCUMENT_REQUEST", error.getvalue())
+        self.assertIn("unable to reliably load", error.getvalue())
+        self.assertNotIn("Traceback", error.getvalue())
 
     def test_non_finite_values_are_refused_before_rounding_or_emission(self):
         cases = (
