@@ -11,17 +11,14 @@ google-analytics report --profile example --property 987654321 \
   --metrics sessions,activeUsers --dimensions date --limit 100
 google-analytics realtime --profile example --property 987654321 \
   --metrics activeUsers --dimensions country --limit 25
-google-analytics changes --profile example --account 123456 --days 7 --limit 50
 ```
 
 `accounts` and `properties` use the Analytics Admin API's account summaries. `report` and
-`realtime` use the GA4 Data API. `changes` uses Analytics Admin change-history search. Every read is
-bounded by `--limit`; the command reports truncation to stderr when Google indicates more results
-exist.
+`realtime` use the GA4 Data API. Every read is bounded by `--limit`; the command reports truncation
+to stderr when Google indicates more results exist.
 
 Report metrics and dimensions are comma-separated Google API names. `report` accepts Google date
-forms such as `today`, `yesterday`, and `28daysAgo`, or ISO dates. `changes` defaults to the last
-seven days; use `--start-time` and `--end-time` with RFC 3339 timestamps for an exact interval.
+forms such as `today`, `yesterday`, and `28daysAgo`, or ISO dates.
 
 ## Credentials and profiles
 
@@ -113,7 +110,6 @@ bounded `accounts`, `properties`, and one small report. This package has no muta
 - [Google Analytics Admin API account summaries](https://developers.google.com/analytics/devguides/config/admin/v1/rest/v1beta/accountSummaries/list)
 - [Google Analytics Data API runReport](https://developers.google.com/analytics/devguides/reporting/data/v1/rest/v1beta/properties/runReport)
 - [Google Analytics Data API runRealtimeReport](https://developers.google.com/analytics/devguides/reporting/data/v1/rest/v1beta/properties/runRealtimeReport)
-- [Analytics Admin change-history search](https://developers.google.com/analytics/devguides/config/admin/v1/rest/v1beta/accounts/searchChangeHistoryEvents)
 - [Google OAuth 2.0 for web-server applications](https://developers.google.com/identity/protocols/oauth2/web-server)
 - [Google OAuth 2.0](https://developers.google.com/identity/protocols/oauth2)
 - [OAuth 2.0 Playground](https://developers.google.com/oauthplayground/)

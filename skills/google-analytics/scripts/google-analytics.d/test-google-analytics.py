@@ -40,6 +40,16 @@ class Response:
         return self.payload
 
 
+class RawResponse:
+    """A response body Google never should have sent, kept exactly as received."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return self.payload
+
+
 class GoogleAnalyticsTest(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
@@ -321,55 +331,78 @@ class GoogleAnalyticsTest(unittest.TestCase):
             self.module.command_realtime(args)
         self.assertTrue(captured["url"].endswith("properties/456:runRealtimeReport"))
 
-    def test_changes_uses_official_time_field_names(self):
-        args = SimpleNamespace(
-            profile="example", account="123", days=7,
-            start_time="2026-08-01T00:00:00Z", end_time="2026-08-02T00:00:00Z",
-            actions="UPDATED", resource_types="PROPERTY", actor_email="user@example.test",
-            limit=10, json=True,
+    def test_malformed_json_is_reported_without_a_traceback(self):
+        for body in (b"<html>not json</html>", b"\xff\xfe not utf-8"):
+            with self.subTest(body=body):
+                with patch.object(self.module, "open_url", return_value=RawResponse(body)):
+                    with self.assertRaisesRegex(self.module.AnalyticsError, "not valid JSON"):
+                        self.module.api_request("token", "GET", self.module.ADMIN_BASE + "/accountSummaries")
+
+    def test_non_object_api_and_token_responses_are_refused(self):
+        for body in (b"[]", b'"text"', b"7", b"null"):
+            with self.subTest(body=body):
+                with patch.object(self.module, "open_url", return_value=RawResponse(body)):
+                    with self.assertRaisesRegex(self.module.AnalyticsError, "malformed API response"):
+                        self.module.api_request("token", "GET", self.module.ADMIN_BASE + "/accountSummaries")
+                with patch.object(self.module, "open_url", return_value=RawResponse(body)):
+                    with self.assertRaisesRegex(self.module.AnalyticsError, "malformed OAuth token response"):
+                        self.module.refresh_access_token(self.profile)
+
+    def test_non_string_access_token_is_refused(self):
+        with patch.object(self.module, "open_url", return_value=Response({"access_token": {"value": "x"}})):
+            with self.assertRaisesRegex(self.module.AnalyticsError, "no access token"):
+                self.module.refresh_access_token(self.profile)
+
+    def test_account_summaries_refuse_wrong_collection_and_object_shapes(self):
+        cases = (
+            ({"accountSummaries": {"account": "accounts/1"}}, "account summary collection"),
+            ({"accountSummaries": ["accounts/1"]}, "malformed account summary"),
+            ({"accountSummaries": [], "nextPageToken": {"token": "next"}}, "malformed page token"),
         )
-        captured = {}
+        for response, expected in cases:
+            with self.subTest(response=response):
+                with patch.object(self.module, "api_request", return_value=response):
+                    with self.assertRaisesRegex(self.module.AnalyticsError, expected):
+                        self.module.account_summaries("token", 5)
 
-        def fake_request(token, method, url, params=None, payload=None, retries=2):
-            captured.update({"url": url, "payload": payload})
-            return {"changeHistoryEvents": []}
+    def test_report_refuses_wrong_row_and_value_shapes(self):
+        cases = (
+            ({"rows": {"dimensionValues": []}}, "report row collection"),
+            ({"rows": ["20260817"]}, "malformed report row"),
+            ({"rows": [{"dimensionValues": "20260817"}]}, "report dimension value collection"),
+            ({"rows": [{"dimensionValues": ["20260817"]}]}, "malformed report dimension value"),
+            ({"rows": [{"dimensionValues": [], "metricValues": ["12"]}]}, "malformed report metric value"),
+        )
+        for response, expected in cases:
+            with self.subTest(response=response):
+                with self.assertRaisesRegex(self.module.AnalyticsError, expected):
+                    self.module.normalized_report(response, ["date"], ["sessions"], self.profile, "456")
 
-        with patch.object(self.module, "get_profile", return_value=self.profile), patch.object(
+    def test_non_string_resource_identifiers_are_refused(self):
+        with self.assertRaises(self.module.AnalyticsError):
+            self.module.resource_id({"account": 1}, "accounts")
+
+    def test_malformed_response_exits_two_instead_of_raising(self):
+        env = {
+            "GOOGLE_ANALYTICS_CLIENT_ID": "client",
+            "GOOGLE_ANALYTICS_CLIENT_SECRET": "secret",
+            "GOOGLE_ANALYTICS_REFRESH_TOKEN": "refresh",
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(
             self.module, "refresh_access_token", return_value="token"
-        ), patch.object(self.module, "api_request", side_effect=fake_request), redirect_stdout(io.StringIO()):
-            self.module.command_changes(args)
-        self.assertEqual(captured["payload"]["earliestChangeTime"], args.start_time)
-        self.assertEqual(captured["payload"]["latestChangeTime"], args.end_time)
-        self.assertNotIn("startTime", captured["payload"])
-        self.assertTrue(captured["url"].endswith("accounts/123:searchChangeHistoryEvents"))
+        ), patch.object(
+            self.module, "open_url", return_value=RawResponse(b"<html>not json</html>")
+        ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
+            code = self.module.main(["accounts"])
+        self.assertEqual(2, code)
+        self.assertIn("not valid JSON", error.getvalue())
+        self.assertNotIn("Traceback", error.getvalue())
 
     def test_invalid_property_and_excessive_limits_are_refused(self):
         with self.assertRaises(self.module.AnalyticsError):
             self.module.resource_id("not-an-id", "properties")
         with self.assertRaises(self.module.AnalyticsError):
             self.module.bounded_limit(10001)
-
-    def test_partial_change_interval_is_refused(self):
-        args = SimpleNamespace(start_time="2026-08-01T00:00:00Z", end_time=None, days=7)
-        with self.assertRaises(self.module.AnalyticsError):
-            self.module.change_interval(args)
-
-    def test_change_interval_requires_rfc3339_with_timezone(self):
-        cases = (
-            ("not-a-time", "also-bad"),
-            ("2026-08-01T00:00:00", "2026-08-02T00:00:00"),
-        )
-        for start, end in cases:
-            with self.subTest(start=start):
-                args = SimpleNamespace(start_time=start, end_time=end, days=7)
-                with self.assertRaisesRegex(self.module.AnalyticsError, "RFC 3339|timezone"):
-                    self.module.change_interval(args)
-
-    def test_change_interval_accepts_nanosecond_rfc3339_on_python_39(self):
-        start = "2026-08-01T00:00:00.123456789Z"
-        end = "2026-08-02T00:00:00.987654321Z"
-        args = SimpleNamespace(start_time=start, end_time=end, days=7)
-        self.assertEqual((start, end), self.module.change_interval(args))
 
     def test_launcher_help_resolves_outside_repository(self):
         completed = subprocess.run(

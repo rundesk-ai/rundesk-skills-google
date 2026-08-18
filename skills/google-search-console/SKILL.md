@@ -17,8 +17,8 @@ available:
 "$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" sites --profile <profile> --limit 25
 ```
 
-Keep performance reads narrow. Default to the last 28 complete days and a small row limit; add only
-the dimensions needed for the question:
+Keep performance reads narrow. Default to the last 28 complete days in Google's Pacific reporting
+zone and a small row limit; add only the dimensions needed for the question:
 
 ```sh
 "$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" performance \
@@ -34,7 +34,8 @@ Always reuse the exact property identifier returned by `sites`.
 
 Performance rows are aggregated and may omit anonymized queries. Treat clicks, impressions,
 click-through rate, and average position as Search Console measurements, not complete traffic or
-ranking truth. State the date range and dimensions with findings.
+ranking truth. State the date range and dimensions with findings, and report dates as Pacific
+reporting days rather than local ones.
 
 This package is read-only. It cannot add properties, submit or delete sitemaps, request indexing,
 or change Search Console configuration.

@@ -1,6 +1,6 @@
 ---
 name: google-analytics
-description: Use when the user needs to inspect Google Analytics 4 accounts or properties, analyze bounded historical or realtime GA4 metrics, or review Analytics Admin change history. It supplies read-only GA4 discovery and reporting through explicitly selected credential profiles and properties. Do not use for Universal Analytics, tag implementation, Google Ads, Search Console, or Analytics configuration changes.
+description: Use when the user needs to inspect Google Analytics 4 accounts or properties or analyze bounded historical or realtime GA4 metrics. It supplies read-only GA4 discovery and reporting through explicitly selected credential profiles and properties. Do not use for Universal Analytics, tag implementation, Google Ads, Search Console, Analytics Admin change history, or Analytics configuration changes.
 ---
 
 # Google Analytics
@@ -22,7 +22,6 @@ Never guess a profile or property. Use the exact numeric property ID returned by
 ```sh
 "$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" report --profile <profile> --property <id> --start-date 28daysAgo --end-date today --metrics sessions,activeUsers --dimensions date --limit 100
 "$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" realtime --profile <profile> --property <id> --metrics activeUsers --dimensions country --limit 25
-"$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" changes --profile <profile> --account <id> --days 7 --limit 50
 ```
 
 Keep dimensions, metrics, date ranges, and row limits no broader than the question requires. Human

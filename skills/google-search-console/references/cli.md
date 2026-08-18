@@ -16,8 +16,10 @@ output. `sites`, `performance`, and `sitemaps` default to 25 results and accept 
 1,000. When a list is cut to the requested limit, the command warns on stderr that output may be
 truncated.
 
-`performance` defaults to the last 28 complete UTC days. Use either `--days` or both
-`--start-date` and `--end-date`. Supported dimensions are `date`, `country`, `device`, `page`,
+`performance` defaults to the last 28 complete days in Google's Pacific reporting zone
+(`America/Los_Angeles`), which is how Search Console buckets rows; a late-evening UTC run therefore
+still ends on the prior Pacific day. Use either `--days` or both `--start-date` and `--end-date`,
+which are passed to Google verbatim. Supported dimensions are `date`, `country`, `device`, `page`,
 `query`, and `searchAppearance`; repeat `--dimension` to group by more than one. Optional
 `--search-type` values are `web`, `image`, `video`, `news`, `discover`, and `googleNews`.
 

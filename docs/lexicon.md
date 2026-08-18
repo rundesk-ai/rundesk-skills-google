@@ -35,6 +35,9 @@ Search Console query, page, country, device, date, and search-appearance results
 Analytics. Use `performance` for the command and report concept. Avoid generic `analytics`, which is
 ambiguous with Google Analytics.
 
+A Search Console date is a Pacific reporting day, not a UTC or local one. Say `Pacific reporting
+day` when the distinction affects which days count as complete.
+
 ### URL inspection
 
 Google's indexed-state inspection for one URL under one Search Console site. Use `inspect-url` for
@@ -57,8 +60,3 @@ not call it a `site`; one property can receive data from several web or app stre
 A bounded result from the Google Analytics Data API. Use `report` for historical data and
 `realtime` for the Realtime API. Preserve Google-defined metric and dimension names verbatim at the
 API boundary.
-
-### Change history
-
-Administrative changes returned by the Analytics Admin API. Use `change-history`; avoid vague names
-such as `updates` or `activity`.

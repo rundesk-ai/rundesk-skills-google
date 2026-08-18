@@ -14,6 +14,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import zoneinfo
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -31,6 +32,8 @@ ACCOUNT_RE = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)*")
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 WEBMASTERS_API = "https://www.googleapis.com/webmasters/v3"
 INSPECTION_API = "https://searchconsole.googleapis.com/v1"
+# Search Console buckets every row by Pacific day, so complete-day defaults must use that zone.
+PACIFIC_ZONE = "America/Los_Angeles"
 
 
 class SearchConsoleError(RuntimeError):
@@ -44,6 +47,53 @@ class Profile:
     client_secret: str = field(repr=False)
     refresh_token: str = field(repr=False)
     label: str
+
+
+class PacificFallback(dt.tzinfo):
+    """US Pacific rules in force since 2007, used only where no IANA database is installed.
+
+    Converting a UTC instant reproduces the IANA wall clock exactly. Like the tzinfo example in
+    Python's own documentation, it cannot name the repeated hour at the autumn transition, which
+    does not matter here because only the resulting Pacific date is ever read.
+    """
+
+    def utcoffset(self, value: dt.datetime | None) -> dt.timedelta:
+        return dt.timedelta(hours=-7) if self._is_daylight(value) else dt.timedelta(hours=-8)
+
+    def dst(self, value: dt.datetime | None) -> dt.timedelta:
+        return dt.timedelta(hours=1) if self._is_daylight(value) else dt.timedelta(0)
+
+    def tzname(self, value: dt.datetime | None) -> str:
+        return "PDT" if self._is_daylight(value) else "PST"
+
+    @staticmethod
+    def _is_daylight(value: dt.datetime | None) -> bool:
+        if value is None:
+            return False
+        # utcoffset minus dst is a constant -8 hours, so tzinfo.fromutc hands this rule a local
+        # standard-time value, which is the frame the statute defines the transitions in.
+        local = value.replace(tzinfo=None)
+        march = dt.datetime(local.year, 3, 1)
+        november = dt.datetime(local.year, 11, 1)
+        begins = march + dt.timedelta(days=7 + (6 - march.weekday()) % 7, hours=2)
+        ends = november + dt.timedelta(days=(6 - november.weekday()) % 7, hours=1)
+        return begins <= local < ends
+
+
+def pacific_zone() -> dt.tzinfo:
+    try:
+        return zoneinfo.ZoneInfo(PACIFIC_ZONE)
+    except zoneinfo.ZoneInfoNotFoundError:
+        return PacificFallback()
+
+
+def utc_now() -> dt.datetime:
+    """The single clock reading, isolated so tests can freeze a Pacific-day boundary."""
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def pacific_today() -> dt.date:
+    return utc_now().astimezone(pacific_zone()).date()
 
 
 def env_candidates() -> list[Path]:
@@ -209,7 +259,25 @@ def open_url(request: urllib.request.Request, timeout: int = 30):
     return urllib.request.build_opener(RejectRedirectHandler()).open(request, timeout=timeout)
 
 
-def request_json(url: str, *, method: str = "GET", headers: dict[str, str] | None = None, body: dict[str, Any] | None = None, opener: Callable[..., Any] = open_url) -> dict[str, Any]:
+def expect_object(value: Any, noun: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise SearchConsoleError(f"Google returned a malformed {noun}.")
+    return value
+
+
+def expect_list(container: dict[str, Any], key: str, noun: str) -> list[Any]:
+    value = container.get(key, [])
+    if not isinstance(value, list):
+        raise SearchConsoleError(f"Google returned a malformed {noun} collection.")
+    return value
+
+
+def expect_objects(container: dict[str, Any], key: str, noun: str) -> list[dict[str, Any]]:
+    return [expect_object(item, noun) for item in expect_list(container, key, noun)]
+
+
+def request_json(url: str, *, method: str = "GET", headers: dict[str, str] | None = None, body: dict[str, Any] | None = None, opener: Callable[..., Any] | None = None) -> dict[str, Any]:
+    opener = opener or open_url
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     if body is not None:
@@ -226,13 +294,18 @@ def request_json(url: str, *, method: str = "GET", headers: dict[str, str] | Non
         raise SearchConsoleError(f"Google API request failed with HTTP {exc.code}" + (f": {message}" if message else ".")) from exc
     except urllib.error.URLError as exc:
         raise SearchConsoleError(f"Google API request failed: {exc.reason}") from exc
+    if not payload:
+        return {}
     try:
-        return json.loads(payload) if payload else {}
+        decoded = json.loads(payload)
     except ValueError as exc:
         raise SearchConsoleError("Google API returned invalid JSON.") from exc
+    # A list or scalar body would otherwise surface as an attribute error several frames later.
+    return expect_object(decoded, "API response")
 
 
-def access_token(profile: Profile, opener: Callable[..., Any] = open_url) -> str:
+def access_token(profile: Profile, opener: Callable[..., Any] | None = None) -> str:
+    opener = opener or open_url
     data = urllib.parse.urlencode({
         "client_id": profile.client_id,
         "client_secret": profile.client_secret,
@@ -245,8 +318,8 @@ def access_token(profile: Profile, opener: Callable[..., Any] = open_url) -> str
             result = json.loads(response.read().decode("utf-8"))
     except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as exc:
         raise SearchConsoleError("Google OAuth token refresh failed; verify the profile credentials and grant.") from exc
-    token = result.get("access_token", "")
-    if not token:
+    token = expect_object(result, "OAuth token response").get("access_token", "")
+    if not isinstance(token, str) or not token:
         raise SearchConsoleError("Google OAuth token refresh returned no access token.")
     return token
 
@@ -283,7 +356,7 @@ def cmd_profiles(args: argparse.Namespace) -> None:
 
 def cmd_sites(args: argparse.Namespace) -> None:
     profile = selected_profile(args)
-    entries = api(profile, "/sites").get("siteEntry", [])
+    entries = expect_objects(api(profile, "/sites"), "siteEntry", "site entry")
     rows = [{"site": item.get("siteUrl", ""), "permission": item.get("permissionLevel", ""), "profile": profile.name} for item in bounded(entries, args.limit, "sites")]
     write_rows(rows, ["site", "permission", "profile"], args.json)
 
@@ -299,7 +372,7 @@ def date_range(args: argparse.Namespace) -> tuple[str, str]:
         if start > end:
             raise SearchConsoleError("--start-date must not be after --end-date.")
         return start.isoformat(), end.isoformat()
-    end = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
+    end = pacific_today() - dt.timedelta(days=1)
     return (end - dt.timedelta(days=args.days - 1)).isoformat(), end.isoformat()
 
 
@@ -312,7 +385,7 @@ def cmd_performance(args: argparse.Namespace) -> None:
     if args.search_type:
         body["type"] = args.search_type
     path = "/sites/" + urllib.parse.quote(args.site, safe="") + "/searchAnalytics/query"
-    items = api(profile, path, method="POST", body=body).get("rows", [])
+    items = expect_objects(api(profile, path, method="POST", body=body), "rows", "performance row")
     if len(items) == args.limit:
         print(
             f"WARNING: performance output reached the {args.limit}-row limit and may be truncated.",
@@ -320,7 +393,7 @@ def cmd_performance(args: argparse.Namespace) -> None:
         )
     rows = []
     for item in items:
-        row = {dimension: value for dimension, value in zip(args.dimension, item.get("keys", []))}
+        row = {dimension: value for dimension, value in zip(args.dimension, expect_list(item, "keys", "performance row key"))}
         row.update({"clicks": item.get("clicks", 0), "impressions": item.get("impressions", 0), "ctr": item.get("ctr", 0), "position": item.get("position", 0), "profile": profile.name})
         rows.append(row)
     write_rows(rows, args.dimension + ["clicks", "impressions", "ctr", "position", "profile"], args.json)
@@ -340,7 +413,7 @@ def cmd_inspect(args: argparse.Namespace) -> None:
 def cmd_sitemaps(args: argparse.Namespace) -> None:
     profile = selected_profile(args)
     path = "/sites/" + urllib.parse.quote(args.site, safe="") + "/sitemaps"
-    items = api(profile, path).get("sitemap", [])
+    items = expect_objects(api(profile, path), "sitemap", "sitemap entry")
     rows = [{"path": item.get("path", ""), "type": item.get("type", ""), "submitted": item.get("lastSubmitted", ""), "downloaded": item.get("lastDownloaded", ""), "pending": item.get("isPending", False), "warnings": item.get("warnings", 0), "errors": item.get("errors", 0), "profile": profile.name} for item in bounded(items, args.limit, "sitemaps")]
     write_rows(rows, ["path", "type", "submitted", "downloaded", "pending", "warnings", "errors", "profile"], args.json)
 

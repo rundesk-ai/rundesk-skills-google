@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Read bounded Google Analytics 4 account, report, realtime, and change-history data."""
+"""Read bounded Google Analytics 4 account, report, and realtime data."""
 
 from __future__ import annotations
 
 import argparse
 import csv
-import datetime as dt
 import json
 import os
 import re
@@ -236,9 +235,29 @@ def open_url(request: urllib.request.Request, timeout: int = 30):
     return urllib.request.build_opener(RejectRedirectHandler()).open(request, timeout=timeout)
 
 
-def decode_response(response: Any) -> Dict[str, Any]:
+def expect_object(value: Any, noun: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AnalyticsError(f"Google Analytics returned a malformed {noun}.")
+    return value
+
+
+def expect_objects(container: Dict[str, Any], key: str, noun: str) -> List[Dict[str, Any]]:
+    items = container.get(key, [])
+    if not isinstance(items, list):
+        raise AnalyticsError(f"Google Analytics returned a malformed {noun} collection.")
+    return [expect_object(item, noun) for item in items]
+
+
+def decode_response(response: Any, noun: str = "API response") -> Dict[str, Any]:
     raw = response.read()
-    return json.loads(raw.decode("utf-8")) if raw else {}
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AnalyticsError(f"Google Analytics returned a malformed {noun}: the body is not valid JSON.") from exc
+    # A list or scalar body would otherwise surface as an attribute error several frames later.
+    return expect_object(payload, noun)
 
 
 def safe_error(exc: urllib.error.HTTPError) -> str:
@@ -268,15 +287,15 @@ def refresh_access_token(profile: Profile) -> str:
         method="POST",
     )
     try:
-        payload = decode_response(open_url(request))
+        payload = decode_response(open_url(request), "OAuth token response")
     except urllib.error.HTTPError as exc:
         raise AnalyticsError(f"Google OAuth token refresh failed: {safe_error(exc)}.") from exc
     except urllib.error.URLError as exc:
         raise AnalyticsError(f"Google OAuth token refresh failed: {exc.reason}.") from exc
     token = payload.get("access_token")
-    if not token:
+    if not isinstance(token, str) or not token:
         raise AnalyticsError("Google OAuth token refresh returned no access token.")
-    return str(token)
+    return token
 
 
 def api_request(
@@ -315,7 +334,9 @@ def api_request(
     raise AnalyticsError("Google Analytics API request failed.")
 
 
-def resource_id(value: str, prefix: str) -> str:
+def resource_id(value: Any, prefix: str) -> str:
+    if not isinstance(value, str):
+        raise AnalyticsError(f"Expected a numeric {prefix[:-1]} ID, got {value!r}.")
     cleaned = value.strip()
     if cleaned.startswith(prefix + "/"):
         cleaned = cleaned.split("/", 1)[1]
@@ -340,12 +361,14 @@ def account_summaries(token: str, limit: int) -> Tuple[List[Dict[str, Any]], boo
         if page_token:
             params["pageToken"] = page_token
         response = api_request(token, "GET", f"{ADMIN_BASE}/accountSummaries", params=params)
-        page = response.get("accountSummaries", [])
+        page = expect_objects(response, "accountSummaries", "account summary")
         remaining = limit - len(rows)
         if len(page) > remaining:
             truncated = True
         rows.extend(page[:remaining])
-        next_token = str(response.get("nextPageToken", ""))
+        next_token = response.get("nextPageToken", "")
+        if not isinstance(next_token, str):
+            raise AnalyticsError("Google Analytics returned a malformed page token.")
         if len(rows) >= limit:
             return rows, truncated or bool(next_token) or len(page) > remaining
         if not next_token:
@@ -404,7 +427,7 @@ def command_accounts(args: argparse.Namespace) -> None:
         {
             "account_id": resource_id(item.get("account", ""), "accounts"),
             "display_name": item.get("displayName", ""),
-            "property_count": len(item.get("propertySummaries", [])),
+            "property_count": len(expect_objects(item, "propertySummaries", "property summary")),
             "profile": profile.name,
         }
         for item in summaries
@@ -429,7 +452,7 @@ def command_properties(args: argparse.Namespace) -> None:
         account_id = resource_id(account.get("account", ""), "accounts")
         if account_filter and account_id != account_filter:
             continue
-        for item in account.get("propertySummaries", []):
+        for item in expect_objects(account, "propertySummaries", "property summary"):
             if len(rows) >= limit:
                 more_properties = True
                 break
@@ -467,14 +490,14 @@ def dimension_metric_names(args: argparse.Namespace) -> Tuple[List[str], List[st
 
 def normalized_report(response: Dict[str, Any], dimensions: List[str], metrics: List[str], profile: Profile, property_id: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for item in response.get("rows", []):
+    for item in expect_objects(response, "rows", "report row"):
+        dimension_values = expect_objects(item, "dimensionValues", "report dimension value")
+        metric_values = expect_objects(item, "metricValues", "report metric value")
         result: Dict[str, Any] = {}
         for index, name in enumerate(dimensions):
-            values = item.get("dimensionValues", [])
-            result[name] = values[index].get("value", "") if index < len(values) else ""
+            result[name] = dimension_values[index].get("value", "") if index < len(dimension_values) else ""
         for index, name in enumerate(metrics):
-            values = item.get("metricValues", [])
-            result[name] = values[index].get("value", "") if index < len(values) else ""
+            result[name] = metric_values[index].get("value", "") if index < len(metric_values) else ""
         result["profile"] = profile.name
         result["property_id"] = property_id
         rows.append(result)
@@ -521,70 +544,6 @@ def command_realtime(args: argparse.Namespace) -> None:
     warn_truncated(response_row_count(response, len(rows)) > len(rows), limit)
 
 
-def change_interval(args: argparse.Namespace) -> Tuple[str, str]:
-    if bool(args.start_time) != bool(args.end_time):
-        raise AnalyticsError("Pass both --start-time and --end-time, or neither.")
-    if args.start_time:
-        for value in (args.start_time, args.end_time):
-            if not re.fullmatch(
-                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
-                value,
-            ):
-                raise AnalyticsError("Change-history times must use RFC 3339.")
-            normalized = re.sub(r"(\.\d{6})\d+", r"\1", value).replace("Z", "+00:00")
-            try:
-                parsed = dt.datetime.fromisoformat(normalized)
-            except ValueError as exc:
-                raise AnalyticsError("Change-history times must use RFC 3339.") from exc
-            if parsed.tzinfo is None:
-                raise AnalyticsError("Change-history times must include a timezone.")
-        return args.start_time, args.end_time
-    end = dt.datetime.now(dt.timezone.utc)
-    start = end - dt.timedelta(days=args.days)
-    return start.isoformat().replace("+00:00", "Z"), end.isoformat().replace("+00:00", "Z")
-
-
-def command_changes(args: argparse.Namespace) -> None:
-    profile = get_profile(selected_profile_name(args))
-    account_id = resource_id(args.account, "accounts")
-    limit = bounded_limit(args.limit, 200)
-    start_time, end_time = change_interval(args)
-    payload: Dict[str, Any] = {
-        "earliestChangeTime": start_time,
-        "latestChangeTime": end_time,
-        "pageSize": limit,
-    }
-    if args.actions:
-        payload["action"] = split_csv(args.actions)
-    if args.resource_types:
-        payload["resourceType"] = split_csv(args.resource_types)
-    if args.actor_email:
-        payload["actorEmail"] = [args.actor_email]
-    response = api_request(refresh_access_token(profile), "POST", f"{ADMIN_BASE}/accounts/{account_id}:searchChangeHistoryEvents", payload=payload)
-    rows = []
-    for event in response.get("changeHistoryEvents", [])[:limit]:
-        changes = event.get("changes", [])
-        rows.append(
-            {
-                "event_id": event.get("id", ""),
-                "change_time": event.get("changeTime", ""),
-                "actor_type": event.get("actorType", ""),
-                "user_actor_email": event.get("userActorEmail", ""),
-                "changes": len(changes),
-                "resources": ";".join(str(change.get("resource", "")) for change in changes),
-                "actions": ";".join(str(change.get("action", "")) for change in changes),
-                "profile": profile.name,
-                "account_id": account_id,
-            }
-        )
-    if args.json:
-        emit_json(rows)
-    else:
-        headers = ("event_id", "change_time", "actor_type", "user_actor_email", "changes", "resources", "actions", "profile", "account_id")
-        emit_csv(headers, ([row[header] for header in headers] for row in rows))
-    warn_truncated(bool(response.get("nextPageToken")), limit)
-
-
 def add_profile_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--env-file", help="Load an explicit dotenv after existing process variables")
     parser.add_argument("--profile", help="Configured Google Analytics profile")
@@ -629,17 +588,6 @@ def build_parser() -> argparse.ArgumentParser:
     realtime.add_argument("--limit", type=int, default=25)
     realtime.set_defaults(handler=command_realtime)
 
-    changes = subparsers.add_parser("changes", help="Inspect Analytics Admin change history")
-    add_profile_option(changes)
-    changes.add_argument("--account", required=True, help="Numeric Analytics account ID")
-    changes.add_argument("--days", type=int, default=7, choices=range(1, 31), metavar="1..30")
-    changes.add_argument("--start-time", help="RFC 3339 interval start")
-    changes.add_argument("--end-time", help="RFC 3339 interval end")
-    changes.add_argument("--actions", help="Comma-separated CREATED,UPDATED,DELETED actions")
-    changes.add_argument("--resource-types", help="Comma-separated Google resource types")
-    changes.add_argument("--actor-email", help="Restrict to one actor email")
-    changes.add_argument("--limit", type=int, default=50)
-    changes.set_defaults(handler=command_changes)
     return parser
 
 
