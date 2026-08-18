@@ -275,10 +275,16 @@ def decode_response(response: Any, noun: str = "API response") -> Dict[str, Any]
 def safe_error(exc: urllib.error.HTTPError) -> str:
     try:
         body = json.loads(exc.read().decode("utf-8"))
-        message = body.get("error", {}).get("message") or body.get("error_description")
+        if not isinstance(body, dict):
+            return f"HTTP {exc.code}"
+        error = body.get("error")
+        message = error.get("message") if isinstance(error, dict) else None
+        message = message or body.get("error_description")
+        if not message and isinstance(error, str):
+            message = error
         if message:
             return str(message)
-    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+    except (UnicodeDecodeError, json.JSONDecodeError):
         pass
     return f"HTTP {exc.code}"
 
@@ -612,6 +618,21 @@ def text_field(row: Dict[str, Any], name: str) -> str:
     return str(value)
 
 
+def count_field(row: Dict[str, Any], name: str) -> str:
+    """Read a non-negative count, treating an omitted protobuf default as zero."""
+    value = row.get(name, 0)
+    if value in (None, ""):
+        return "0"
+    if isinstance(value, bool) or not (
+        isinstance(value, int) or isinstance(value, str) and value.isdigit()
+    ):
+        raise MerchantError(f"Google Merchant returned a malformed {name} value.")
+    count = int(value)
+    if count < 0:
+        raise MerchantError(f"Google Merchant returned a malformed {name} value.")
+    return str(count)
+
+
 def emit_rows(headers: Sequence[str], rows: List[Dict[str, Any]], as_json: bool) -> None:
     if as_json:
         emit_json(rows)
@@ -632,7 +653,6 @@ REPORTING_CONTEXTS = (
 )
 COUNTRY_RE = re.compile(r"[A-Z]{2}")
 ACCOUNT_PAGE_CEILING = 500
-ISSUE_PAGE_CEILING = 100
 STATUS_PAGE_CEILING = 250
 
 
@@ -749,10 +769,10 @@ def command_status(args: argparse.Namespace) -> None:
             {
                 "reporting_context": text_field(status, "reportingContext"),
                 "country": text_field(status, "country"),
-                "active": text_field(stats, "activeCount"),
-                "pending": text_field(stats, "pendingCount"),
-                "expiring": text_field(stats, "expiringCount"),
-                "disapproved": text_field(stats, "disapprovedCount"),
+                "active": count_field(stats, "activeCount"),
+                "pending": count_field(stats, "pendingCount"),
+                "expiring": count_field(stats, "expiringCount"),
+                "disapproved": count_field(stats, "disapprovedCount"),
                 "issue_count": len(expect_objects(status, "itemLevelIssues", "item level issue")),
                 "account_id": account,
                 "profile": profile.name,
@@ -798,7 +818,7 @@ def command_issues(args: argparse.Namespace) -> None:
                     "code": text_field(issue, "code"),
                     "severity": text_field(issue, "severity"),
                     "resolution": text_field(issue, "resolution"),
-                    "products": text_field(issue, "productCount"),
+                    "products": count_field(issue, "productCount"),
                     "attribute": text_field(issue, "attribute"),
                     "reporting_context": context,
                     "country": country,
@@ -915,10 +935,6 @@ PERFORMANCE_METRICS = (
     "conversion_rate",
 )
 MONEY_FIELDS = frozenset({"price", "benchmark_price", "suggested_price", "conversion_value"})
-# Google restricts the conversion metrics to the free traffic source, so an ads-only
-# account sees them empty. That is a measurement boundary, not a failed query.
-FREE_ONLY_METRICS = ("conversions", "conversion_value", "conversion_rate")
-
 PERFORMANCE_BREAKDOWNS = {
     "date": ("date",),
     "week": ("week",),
