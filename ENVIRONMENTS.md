@@ -1,7 +1,8 @@
 # Google Integration Environments
 
-Google integrations separate package runtime, OAuth configuration, and mutable state. This keeps
-catalog updates safe and lets owners grant each service independently.
+Google integrations separate package runtime, sign-in, and mutable state. Rundesk owns Google
+sign-in; a package owns its commands. This keeps catalog updates safe and lets owners grant each
+service independently.
 
 ## Package runtime
 
@@ -14,20 +15,43 @@ environment, runs no setup script, and installs no dependency. Do not create a s
 runtime. If a future package needs a dependency, wait for declarative per-skill runtime support or
 ship a self-contained executable with explicit owner approval.
 
-## OAuth configuration and profiles
+## Google sign-in
 
-Each package declares genuinely required values in `rundesk.json`. Rundesk-managed credentials are
-injected into the command process and are not written into the package.
+Rundesk owns Google OAuth. A package that reaches a Google API declares no client ID, client secret,
+or refresh token, keeps no grant, and contains no OAuth, browser, refresh, or persistence code. It
+asks the install's own CLI for one short-lived access token through Rundesk's hidden `_google`
+bridge, naming only the fixed capability it needs. The answer arrives over one end of an inherited
+anonymous local socket pair as a single length-prefixed JSON frame, so a token never reaches an
+argument, an environment variable, stdout, stderr, a log, or a file. Rundesk refuses any other
+descriptor, including a pipe, a named socket, a regular file, and standard input or output.
+
+An owner connects an account once:
+
+```sh
+rundesk login google [--profile <app-profile>]
+```
+
+A profile is one OAuth app configuration, not a person, and may hold several verified Google
+accounts. Rundesk keys each account by Google's immutable subject identifier and selects it by
+email, so every OAuth command takes `--profile` for the app, `--email` for the account, and `--auth`
+to run that login first. Each is needed only when more than one answer exists; an ambiguous
+selection is refused, and a missing credential or scope is reported with the exact login command to
+run. A Rundesk too old to answer the bridge is reported as that, not as a Google failure.
+
+A new Google package uses this same bridge and its capability name. Do not add a second way to
+authorize.
+
+## Owner-supplied values
+
+A value only an owner can provide, such as an API key, is declared in `rundesk.json`. Rundesk stores
+it outside the catalog and injects it into the command process; it is never written into the package.
 
 The plain declared variable belongs to the default profile. A named profile uses Rundesk's
 `<DECLARED_NAME>__<PROFILE>` form. The double underscore is the profile separator; declared names
 must match `^[A-Z][A-Z0-9_]*$` and cannot contain `__`. A named profile never falls back to a plain
-value because that could combine credentials from different Google identities or OAuth clients.
-Likewise, a profile is resolved entirely from Rundesk's suffix form or entirely from a package's
-documented legacy infix form. A partial profile in one form is reported as incomplete; fields from
-the other form never fill its gaps. A profile configured in both forms is ambiguous and refused.
+value because that could combine values belonging to different owners.
 
-Commands resolve configuration in this order:
+Commands resolve such configuration in this order:
 
 1. variables already present in the command process;
 2. the command's explicit `--env-file`;
@@ -35,12 +59,8 @@ Commands resolve configuration in this order:
 4. `${XDG_CONFIG_HOME:-$HOME/.config}/rundesk/integrations/<skill>/env`;
 5. the legacy `${XDG_CONFIG_HOME:-$HOME/.config}/<skill>/env`, when supported by the package.
 
-There is no catalog-wide Google token file and no implicit cross-package fallback. If two packages
-use the same Google identity, configure each package explicitly. This preserves independent scopes,
-rotation, revocation, and removal.
-
-Credential files must be owner-readable only. Commands warn about broad permissions and never print
-secrets, authorization headers, refresh tokens, or raw dotenv content.
+Configuration files must be owner-readable only. Commands warn about broad permissions and never
+print secrets, authorization headers, or raw dotenv content.
 
 ## Cache and mutable state
 
@@ -54,5 +74,5 @@ update.
 ## Package requirements
 
 Each package provides credential-free `--help`, an offline `profiles` command, explicit profile and
-resource selection, bounded reads, compact text output, and opt-in JSON. Tests use synthetic OAuth
-and API fixtures and never contact Google.
+resource selection, bounded reads, compact text output, and opt-in JSON. Tests are offline: a
+stand-in Rundesk answers the sign-in bridge and synthetic fixtures replace every Google boundary.

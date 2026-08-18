@@ -30,19 +30,27 @@ rundesk skills remove rundesk-skills-google
 rundesk skills remove rundesk-skills-google --confirm
 ```
 
-## Credentials and OAuth profiles
+## Signing in to Google
 
-Each package declares its required OAuth configuration in `rundesk.json`. Rundesk stores configured
-values outside the catalog and passes them to commands as environment variables. The plain variable
-name represents the default profile; `<FIELD>__<PROFILE>` represents a named profile. A named
-profile never falls back to a default-profile value.
+Rundesk owns Google sign-in for every OAuth package here. It holds the OAuth app configuration, runs
+the browser flow, keeps the grant sealed, and refreshes tokens; a package declares no credentials and
+receives one short-lived access token over a private socket when it runs.
 
-Profiles keep Google identities and clients explicit, such as separate company and client access.
-Commands refuse ambiguous profile and Google resource selection. Tokens, OAuth grants, caches, and
-mutable state are never stored below `skills/`.
+```sh
+rundesk login google
+rundesk login google --profile acme
+```
 
-See [ENVIRONMENTS.md](ENVIRONMENTS.md) for the complete ownership and resolution contract. Each
-package's `references/cli.md` documents its exact fields and setup.
+A profile is one OAuth app configuration, not a person. A profile can hold several verified Google
+accounts, so every OAuth command takes `--profile <app-profile>` to choose the app, `--email
+<address>` to choose the account, and `--auth` to run `rundesk login google` first. Each is needed
+only when more than one answer exists, and ambiguity is refused rather than guessed.
+
+`google-pagespeed-insights` reads public pages with a Google Cloud API key instead, which it
+declares in its own `rundesk.json`.
+
+See [ENVIRONMENTS.md](ENVIRONMENTS.md) for the complete ownership contract. Each package's
+`references/cli.md` documents its own scope and commands.
 
 ## Package isolation
 

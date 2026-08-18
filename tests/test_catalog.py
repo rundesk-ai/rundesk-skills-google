@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_SKILLS = {"google-analytics", "google-merchant", "google-pagespeed-insights",
                    "google-search-console"}
+#: Packages Rundesk signs in to Google for. They declare no credentials and hold no OAuth code.
+OAUTH_SKILLS = {"google-analytics", "google-merchant", "google-search-console"}
 ALLOWED_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 DECLARED_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
@@ -52,8 +54,29 @@ class GoogleCatalog(unittest.TestCase):
         declared = {entry["name"] for entry in self.manifest["skills"]}
         self.assertEqual(declared, listed)
 
-    def test_packages_declare_rundesk_credentials(self):
+    def test_google_sign_in_stays_with_rundesk(self):
+        """An OAuth package asks Rundesk for a token and carries no client, grant, or refresh code."""
+        for name in sorted(OAUTH_SKILLS):
+            with self.subTest(skill=name):
+                package = ROOT / "skills" / name
+                self.assertFalse((package / "rundesk.json").exists(),
+                                 "Rundesk holds the Google client, so there is nothing to declare")
+                runtime = (package / "scripts" / f"{name}.d" / f"{name}.py").read_text(encoding="utf-8")
+                for owned_by_rundesk in ("client_secret", "refresh_token", "oauth2.googleapis.com",
+                                         "CLIENT_ID", "webbrowser"):
+                    self.assertNotIn(owned_by_rundesk, runtime)
+                # The one authorization path: the hidden bridge, its version 1 frame, and the
+                # connected unnamed local socket Rundesk is the only other holder of.
+                for spoken in ('"_google"', '"accounts"', "--response-fd", 'struct.unpack(">I"',
+                               "BRIDGE_VERSION = 1", "socket.socketpair(socket.AF_UNIX"):
+                    self.assertIn(spoken, runtime)
+                # Rundesk refuses a pipe, so a package that made one would fail at every call.
+                self.assertNotIn("os.pipe(", runtime)
+
+    def test_packages_declare_only_what_an_owner_must_supply(self):
         for entry in self.manifest["skills"]:
+            if entry["name"] in OAUTH_SKILLS:
+                continue
             with self.subTest(skill=entry["name"]):
                 package = ROOT / entry["path"]
                 declaration = json.loads((package / "rundesk.json").read_text(encoding="utf-8"))

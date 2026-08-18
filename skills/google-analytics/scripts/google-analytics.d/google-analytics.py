@@ -8,223 +8,289 @@ import csv
 import json
 import os
 import re
-import stat
+import shutil
+import socket
+import struct
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 ADMIN_BASE = "https://analyticsadmin.googleapis.com/v1beta"
 DATA_BASE = "https://analyticsdata.googleapis.com/v1beta"
-TOKEN_URL = "https://oauth2.googleapis.com/token"
-ACCOUNT_SUFFIX_RE = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)*")
 FIELD_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 MAX_PAGES = 100
 MAX_DIMENSIONS = 9
 MAX_METRICS = 10
-REQUIRED_FIELDS = (
-    "GOOGLE_ANALYTICS_CLIENT_ID",
-    "GOOGLE_ANALYTICS_CLIENT_SECRET",
-    "GOOGLE_ANALYTICS_REFRESH_TOKEN",
-)
-LEGACY_FIELDS = {
-    "GOOGLE_ANALYTICS_CLIENT_ID": "CLIENT_ID",
-    "GOOGLE_ANALYTICS_CLIENT_SECRET": "CLIENT_SECRET",
-    "GOOGLE_ANALYTICS_REFRESH_TOKEN": "REFRESH_TOKEN",
-    "GOOGLE_ANALYTICS_LABEL": "LABEL",
-}
 
 
 class AnalyticsError(RuntimeError):
     """A safe, user-facing Analytics integration failure."""
 
 
-@dataclass(frozen=True)
-class Profile:
-    name: str
-    client_id: str = field(repr=False)
-    client_secret: str = field(repr=False)
-    refresh_token: str = field(repr=False)
-    label: str
-
-
-def profile_suffix(name: str) -> str:
-    return re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")
-
-
-def profile_label(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-
-
 def split_csv(value: str) -> List[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
-def load_dotenv(path: Path, *, required: bool = False) -> None:
-    if not path.exists():
-        if required:
-            raise AnalyticsError(f"Environment file does not exist: {path}")
-        return
-    try:
-        mode = stat.S_IMODE(path.stat().st_mode)
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise AnalyticsError(f"Cannot read environment file {path}: {exc.strerror or exc}") from exc
-    if mode & 0o077:
-        print(f"WARNING: {path} is readable beyond its owner; run `chmod 600 {path}`.", file=sys.stderr)
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-            os.environ.setdefault(key, value)
+# --- Rundesk-managed Google sign-in -------------------------------------------------------------
+#
+# Rundesk owns the OAuth client, the browser, the refresh token, and where those are kept. This
+# package owns none of it and asks the install's own CLI for one short-lived access token, which
+# arrives over one connected unnamed local socket held by nothing but these two processes rather
+# than through argv, the environment, stdout, or a file. The wire format is Rundesk's hidden
+# `_google` bridge, version 1. Rundesk refuses a pipe, a named socket, a regular file, and 0, 1, 2.
+COMMAND_VARIABLE = "RUNDESK_COMMAND"
+# Which fixed Google scope Rundesk attaches to a token for this package. Rundesk maps the name; the
+# scope itself is never chosen here.
+CAPABILITY = "analytics"
+BRIDGE_VERSION = 1
+MAX_FRAME = 65536
+# One bound for a whole child, not for each step of one: a request that spends its time reading a
+# frame has that much less left to be waited on. Rundesk gives a person 180 seconds at the browser
+# when a grant has to be widened, and its own calls to Google time out at 30, so this covers every
+# phase and still ends.
+BRIDGE_SECONDS = 300
+# `rundesk login google` waits on a person at the browser first and on Google afterwards, so its
+# bound is larger than the bridge's. It is still finite: a login nobody completes is stopped rather
+# than left holding this command open.
+SIGN_IN_SECONDS = 420
+# Rundesk's own words about signing in belong beside this command's other diagnostics, never in the
+# rows a caller parses.
+DIAGNOSTIC_FD = 2
+# A Rundesk released before this bridge answers as argparse does: exit 2, naming the choice it did
+# not recognize. Rundesk's own refusals exit 1, so the two are never mistaken for each other.
+UNSUPPORTED_EXIT = 2
+UNSUPPORTED_MARKS = ("invalid choice: '_google'", "invalid choice: 'login'",
+                     "invalid choice: 'google'", "unrecognized arguments")
+MAX_REASON = 400
 
 
-def default_env_paths(explicit: Optional[str]) -> List[Path]:
-    paths: List[Path] = []
-    if explicit:
-        paths.append(Path(explicit).expanduser())
-    for name in ("GOOGLE_ANALYTICS_ENV_FILE", "RUNDESK_INTEGRATIONS_ENV"):
-        if os.environ.get(name):
-            paths.append(Path(os.environ[name]).expanduser())
-    config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
-    paths.extend(
-        [
-            config / "rundesk" / "integrations" / "google-analytics" / "env",
-            config / "google-analytics" / "env",
-        ]
-    )
-    return paths
+def login_command(profile: str) -> str:
+    """The exact command that connects a Google account for one OAuth app profile."""
+    return "rundesk login google" + (f" --profile {profile}" if profile else "")
 
 
-def load_environment(explicit: Optional[str]) -> None:
-    if explicit:
-        load_dotenv(Path(explicit).expanduser(), required=True)
-        return
-    for path in default_env_paths(explicit):
-        if path.exists():
-            load_dotenv(path)
-            break
-
-
-def is_default_profile(name: str) -> bool:
-    return name in ("", "default")
-
-
-def profile_form(name: str) -> str:
-    if is_default_profile(name):
-        return "plain"
-    suffix = profile_suffix(name)
-    has_suffix = any(os.environ.get(f"{field}__{suffix}") for field in REQUIRED_FIELDS)
-    has_legacy = any(
-        os.environ.get(f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[field]}")
-        for field in REQUIRED_FIELDS
-    )
-    if has_suffix and has_legacy:
+def rundesk_command() -> str:
+    """The rundesk this install means, which is a whole path and is not always on PATH."""
+    command = os.environ.get(COMMAND_VARIABLE, "").strip()
+    if command:
+        return command
+    found = shutil.which("rundesk")
+    if not found:
         raise AnalyticsError(
-            f"Profile {name!r} is configured in both Rundesk suffix and legacy infix forms; remove one form."
+            f"This skill signs in through Rundesk, and no Rundesk is reachable: {COMMAND_VARIABLE} "
+            f"is unset and no rundesk command is on PATH. Run: {login_command('')}"
         )
-    if has_suffix:
-        return "suffix"
-    if has_legacy:
-        return "legacy"
-    return "none"
+    return found
 
 
-def profile_value(name: str, field: str) -> str:
-    suffix = profile_suffix(name)
-    if field not in REQUIRED_FIELDS:
-        if suffix:
-            for key in (
-                f"{field}__{suffix}",
-                f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[field]}",
-            ):
-                if os.environ.get(key):
-                    return os.environ[key]
-        return os.environ.get(field, "") if is_default_profile(name) else ""
-    if is_default_profile(name):
-        return os.environ.get(field, "")
-    form = profile_form(name)
-    if form == "suffix":
-        return os.environ.get(f"{field}__{suffix}", "")
-    if form == "legacy":
-        return os.environ.get(f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[field]}", "")
+def read_exactly(connection: socket.socket, wanted: int, deadline: float) -> bytes:
+    """Exactly one bounded segment, refusing rather than waiting on an install that never answers."""
+    held = bytearray()
+    while len(held) < wanted:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AnalyticsError("Rundesk did not answer the Google request in time.")
+        connection.settimeout(remaining)
+        try:
+            part = connection.recv(wanted - len(held))
+        except socket.timeout as exc:
+            raise AnalyticsError("Rundesk did not answer the Google request in time.") from exc
+        if not part:
+            raise AnalyticsError("Rundesk closed the Google response before answering.")
+        held.extend(part)
+    return bytes(held)
+
+
+def read_frame(connection: socket.socket, deadline: float) -> Dict[str, Any]:
+    """One version 1 frame: four big-endian length bytes, then that much compact UTF-8 JSON.
+
+    `deadline` is a `time.monotonic` instant shared with the wait that follows, so reading and
+    reaping cannot each spend the whole allowance.
+    """
+    size = struct.unpack(">I", read_exactly(connection, 4, deadline))[0]
+    if size > MAX_FRAME:
+        raise AnalyticsError("Rundesk sent an oversized Google response.")
+    try:
+        payload = json.loads(read_exactly(connection, size, deadline).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise AnalyticsError("Rundesk sent a malformed Google response.") from exc
+    if not isinstance(payload, dict) or payload.get("version") != BRIDGE_VERSION:
+        raise AnalyticsError("Rundesk sent a Google response version this package cannot read.")
+    if payload.get("ok") is not True:
+        raise AnalyticsError("Rundesk refused the Google request.")
+    return payload
+
+
+def bridge_reason(said: str) -> str:
+    """Rundesk's own refusal, bounded, and never more of another program's output than that."""
+    for line in said.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        head, marker, reason = stripped.partition(" — ")
+        return (reason if marker and head.endswith("FAILED") else stripped)[:MAX_REASON]
     return ""
 
 
-def missing_name(name: str, field: str) -> str:
-    if is_default_profile(name):
-        return field
-    suffix = profile_suffix(name)
-    if profile_form(name) == "legacy":
-        return f"GOOGLE_ANALYTICS_{suffix}_{LEGACY_FIELDS[field]}"
-    return f"{field}__{suffix}"
+def unsupported(code: int, said: str) -> bool:
+    """Whether this Rundesk predates managed sign-in rather than having refused the request."""
+    return code == UNSUPPORTED_EXIT and any(mark in said for mark in UNSUPPORTED_MARKS)
 
 
-def configured_profile_names() -> List[str]:
-    explicit = split_csv(os.environ.get("GOOGLE_ANALYTICS_PROFILES", ""))
-    if explicit:
-        return sorted(set(explicit))
-    suffixed = set()
-    infixed = set()
-    legacy_pattern = re.compile(
-        r"^GOOGLE_ANALYTICS_(.+)_(CLIENT_ID|CLIENT_SECRET|REFRESH_TOKEN|LABEL)$"
-    )
-    for key in os.environ:
-        for field in REQUIRED_FIELDS:
-            prefix = field + "__"
-            candidate = key[len(prefix):] if key.startswith(prefix) else ""
-            if candidate and ACCOUNT_SUFFIX_RE.fullmatch(candidate):
-                suffixed.add(profile_label(key[len(prefix) :]))
-        match = legacy_pattern.match(key)
-        if match:
-            if match.group(1) == "DEFAULT":
-                infixed.add("default")
-            elif match.group(1) not in {"CLIENT", "REFRESH"}:
-                infixed.add(profile_label(match.group(1)))
-    names = suffixed | infixed
-    if not infixed and any(os.environ.get(field) for field in REQUIRED_FIELDS):
-        names.add(os.environ.get("GOOGLE_ANALYTICS_DEFAULT_PROFILE") or "default")
-    return sorted(names)
-
-
-def get_profile(name: str) -> Profile:
-    values = {field: profile_value(name, field) for field in REQUIRED_FIELDS}
-    missing = [missing_name(name, field) for field, value in values.items() if not value]
-    if missing:
-        raise AnalyticsError(
-            "Missing Google Analytics config: "
-            + ", ".join(missing)
-            + ". Run `rundesk skills configure`, add it to the secrets dotenv, or export it in the shell."
+def refused(code: int, said: str, profile: str, trouble: str = "") -> AnalyticsError:
+    if unsupported(code, said):
+        return AnalyticsError(
+            "This Rundesk install is older than Rundesk-managed Google sign-in. Update Rundesk, "
+            f"then run: {login_command(profile)}"
         )
-    return Profile(
-        name=name,
-        client_id=values["GOOGLE_ANALYTICS_CLIENT_ID"],
-        client_secret=values["GOOGLE_ANALYTICS_CLIENT_SECRET"],
-        refresh_token=values["GOOGLE_ANALYTICS_REFRESH_TOKEN"],
-        label=profile_value(name, "GOOGLE_ANALYTICS_LABEL") or name,
+    reason = bridge_reason(said) or trouble or f"rundesk exited {code}"
+    return AnalyticsError(
+        f"Rundesk did not grant Google access: {reason}. Run: {login_command(profile)}"
     )
 
 
-def selected_profile_name(args: argparse.Namespace) -> str:
-    if getattr(args, "profile", None):
-        return args.profile
-    names = configured_profile_names()
-    if len(names) == 1:
-        return names[0]
-    if not names:
-        raise AnalyticsError("No Google Analytics profiles are configured. Run `rundesk skills configure`.")
-    raise AnalyticsError("Multiple Google Analytics profiles are configured; pass --profile explicitly.")
+def finished(process: subprocess.Popen, deadline: float, doing: str) -> Tuple[str, int]:
+    """What Rundesk said and how it ended, never leaving a child of this command behind.
+
+    A child still running at the deadline is killed and reaped here, so no command of this package
+    can be held open by one that stopped answering.
+    """
+    try:
+        _, said = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise AnalyticsError(f"Rundesk did not finish {doing} in time, and was stopped.")
+    return said or "", process.returncode
+
+
+def ask_rundesk(action: List[str], profile: str, seconds: Optional[float] = None) -> Dict[str, Any]:
+    """One `_google` answer, read from a socket pair no other process holds an end of."""
+    command = rundesk_command()
+    # One deadline for the whole transaction: spawning, reading the frame, and waiting for the exit
+    # share it, so a child that stalls in any one phase cannot extend the others.
+    deadline = time.monotonic() + (BRIDGE_SECONDS if seconds is None else seconds)
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        try:
+            process = subprocess.Popen(
+                [command, "_google"] + action + ["--response-fd", str(theirs.fileno())],
+                stdin=subprocess.DEVNULL, stdout=DIAGNOSTIC_FD, stderr=subprocess.PIPE,
+                pass_fds=(theirs.fileno(),), text=True,
+            )
+        except OSError as exc:
+            raise AnalyticsError(
+                f"Cannot run {command} to reach Google: {exc.strerror or exc}."
+            ) from exc
+        finally:
+            # Rundesk holds the only other end, so its refusal closes the socket instead of leaving
+            # this command waiting on an end it holds open itself.
+            theirs.close()
+        payload: Dict[str, Any] = {}
+        trouble = ""
+        try:
+            # Read before waiting: Rundesk writes under its own deadline, and a child blocked on
+            # that write would never be reaped by a wait that came first.
+            payload = read_frame(ours, deadline)
+        except AnalyticsError as exc:
+            trouble = str(exc)
+        said, code = finished(process, deadline, "the Google request")
+    finally:
+        ours.close()
+    if code != 0 or not payload:
+        raise refused(code, said, profile, trouble)
+    return payload
+
+
+def profile_action(action: List[str], profile: str) -> List[str]:
+    return action + (["--profile", profile] if profile else [])
+
+
+def signed_in_accounts(profile: str) -> List[str]:
+    """Every Google account Rundesk holds for one OAuth app profile. Local, with no network call."""
+    accounts = ask_rundesk(profile_action(["accounts"], profile), profile).get("accounts")
+    if not isinstance(accounts, list) or not all(isinstance(one, str) for one in accounts):
+        raise AnalyticsError("Rundesk sent a malformed Google account list.")
+    return accounts
+
+
+def managed_token(profile: str, email: str) -> Tuple[str, str]:
+    """One short-lived token and the verified account it belongs to."""
+    action = profile_action(["access", CAPABILITY], profile)
+    payload = ask_rundesk(action + (["--email", email] if email else []), profile)
+    token, expires, who = (payload.get("access_token"), payload.get("expires_at"),
+                           payload.get("email"))
+    # bool is an int, and an expiry of True would otherwise pass every check below.
+    if (not isinstance(token, str) or not token or not isinstance(who, str) or not who
+            or isinstance(expires, bool) or not isinstance(expires, int)):
+        raise AnalyticsError("Rundesk sent no usable Google access token.")
+    if expires <= int(time.time()):
+        raise AnalyticsError(
+            f"Rundesk sent an already expired Google access token. Run: {login_command(profile)}"
+        )
+    return token, who
+
+
+def sign_in(profile: str, seconds: Optional[float] = None) -> None:
+    """Rundesk's own public login, so the person sees the browser step and its result."""
+    command = rundesk_command()
+    action = ["login", "google"] + (["--profile", profile] if profile else [])
+    deadline = time.monotonic() + (SIGN_IN_SECONDS if seconds is None else seconds)
+    try:
+        process = subprocess.Popen(
+            [command] + action, stdin=subprocess.DEVNULL, stdout=DIAGNOSTIC_FD,
+            stderr=subprocess.PIPE, text=True,
+        )
+    except OSError as exc:
+        raise AnalyticsError(
+            f"Cannot run {command} to sign in to Google: {exc.strerror or exc}."
+        ) from exc
+    said, code = finished(process, deadline, "signing in to Google")
+    if code != 0:
+        raise refused(code, said, profile)
+
+
+class Access:
+    """A Google account Rundesk holds. This package sees a token for it and never a grant."""
+
+    def __init__(self, profile: str, email: str) -> None:
+        self.profile = profile
+        self.wanted_email = email
+        self.name = profile or "default"
+        self.email = ""
+        self._token = ""
+
+    def token(self) -> str:
+        """The one token this command uses, fetched once and kept only in memory."""
+        if not self._token:
+            self._token, self.email = managed_token(self.profile, self.wanted_email)
+        return self._token
+
+
+def managed_rows(profile: str) -> List[Dict[str, Any]]:
+    """What Rundesk holds for one app profile, saying why rather than failing the whole listing."""
+    named = profile or "default"
+    try:
+        accounts = signed_in_accounts(profile)
+    except AnalyticsError as exc:
+        return [{"profile": named, "account": "", "status": str(exc)}]
+    if not accounts:
+        return [{"profile": named, "account": "", "status": f"run: {login_command(profile)}"}]
+    return [{"profile": named, "account": account, "status": "ready"} for account in accounts]
+
+
+def selected_access(args: argparse.Namespace) -> Access:
+    """The one Google account this command will use, named before anything is asked of Google."""
+    profile = (getattr(args, "profile", "") or "").strip()
+    if getattr(args, "auth", False):
+        sign_in(profile)
+    return Access(profile, (getattr(args, "email", "") or "").strip())
 
 
 class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -272,33 +338,6 @@ def safe_error(exc: urllib.error.HTTPError) -> str:
     except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
         pass
     return f"HTTP {exc.code}"
-
-
-def refresh_access_token(profile: Profile) -> str:
-    form = urllib.parse.urlencode(
-        {
-            "client_id": profile.client_id,
-            "client_secret": profile.client_secret,
-            "refresh_token": profile.refresh_token,
-            "grant_type": "refresh_token",
-        }
-    ).encode("ascii")
-    request = urllib.request.Request(
-        TOKEN_URL,
-        data=form,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    try:
-        payload = decode_response(open_url(request), "OAuth token response")
-    except urllib.error.HTTPError as exc:
-        raise AnalyticsError(f"Google OAuth token refresh failed: {safe_error(exc)}.") from exc
-    except urllib.error.URLError as exc:
-        raise AnalyticsError(f"Google OAuth token refresh failed: {exc.reason}.") from exc
-    token = payload.get("access_token")
-    if not isinstance(token, str) or not token:
-        raise AnalyticsError("Google OAuth token refresh returned no access token.")
-    return token
 
 
 def api_request(
@@ -410,28 +449,29 @@ def response_row_count(response: Dict[str, Any], returned: int) -> int:
 
 
 def command_profiles(args: argparse.Namespace) -> None:
-    names = configured_profile_names()
-    rows = []
-    for name in names:
-        configured = all(profile_value(name, field) for field in REQUIRED_FIELDS)
-        rows.append({"profile": name, "label": profile_value(name, "GOOGLE_ANALYTICS_LABEL") or name, "configured": configured})
+    """Which Google accounts Rundesk holds for one OAuth app profile, without asking Google."""
+    profile = (args.profile or "").strip()
+    if args.auth:
+        sign_in(profile)
+    rows = managed_rows(profile)
+    columns = ("profile", "account", "status")
     if args.json:
         emit_json(rows)
     else:
-        emit_csv(("profile", "label", "configured"), ((r["profile"], r["label"], str(r["configured"]).lower()) for r in rows))
+        emit_csv(columns, (tuple(row[column] for column in columns) for row in rows))
 
 
 def command_accounts(args: argparse.Namespace) -> None:
-    profile = get_profile(selected_profile_name(args))
+    access = selected_access(args)
     limit = bounded_limit(args.limit, 2000)
-    token = refresh_access_token(profile)
+    token = access.token()
     summaries, truncated = account_summaries(token, limit)
     rows = [
         {
             "account_id": resource_id(item.get("account", ""), "accounts"),
             "display_name": item.get("displayName", ""),
             "property_count": len(expect_objects(item, "propertySummaries", "property summary")),
-            "profile": profile.name,
+            "profile": access.name,
         }
         for item in summaries
     ]
@@ -443,10 +483,10 @@ def command_accounts(args: argparse.Namespace) -> None:
 
 
 def command_properties(args: argparse.Namespace) -> None:
-    profile = get_profile(selected_profile_name(args))
+    access = selected_access(args)
     limit = bounded_limit(args.limit, 5000)
     account_filter = resource_id(args.account, "accounts") if args.account else ""
-    token = refresh_access_token(profile)
+    token = access.token()
     # Account summaries are bounded separately; each returned account may carry many properties.
     summaries, account_truncated = account_summaries(token, 2000)
     rows: List[Dict[str, Any]] = []
@@ -466,7 +506,7 @@ def command_properties(args: argparse.Namespace) -> None:
                     "property_type": item.get("propertyType", ""),
                     "parent": item.get("parent", account.get("account", "")),
                     "account_id": account_id,
-                    "profile": profile.name,
+                    "profile": access.name,
                 }
             )
     if args.json:
@@ -493,7 +533,7 @@ def dimension_metric_names(args: argparse.Namespace) -> Tuple[List[str], List[st
     return dimensions, metrics
 
 
-def normalized_report(response: Dict[str, Any], dimensions: List[str], metrics: List[str], profile: Profile, property_id: str) -> List[Dict[str, Any]]:
+def normalized_report(response: Dict[str, Any], dimensions: List[str], metrics: List[str], access: Access, property_id: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for item in expect_objects(response, "rows", "report row"):
         dimension_values = expect_objects(item, "dimensionValues", "report dimension value")
@@ -503,7 +543,7 @@ def normalized_report(response: Dict[str, Any], dimensions: List[str], metrics: 
             result[name] = dimension_values[index].get("value", "") if index < len(dimension_values) else ""
         for index, name in enumerate(metrics):
             result[name] = metric_values[index].get("value", "") if index < len(metric_values) else ""
-        result["profile"] = profile.name
+        result["profile"] = access.name
         result["property_id"] = property_id
         rows.append(result)
     return rows
@@ -518,7 +558,7 @@ def emit_report(rows: List[Dict[str, Any]], dimensions: List[str], metrics: List
 
 
 def command_report(args: argparse.Namespace) -> None:
-    profile = get_profile(selected_profile_name(args))
+    access = selected_access(args)
     property_id = resource_id(args.property, "properties")
     limit = bounded_limit(args.limit)
     dimensions, metrics = dimension_metric_names(args)
@@ -529,22 +569,22 @@ def command_report(args: argparse.Namespace) -> None:
     }
     if dimensions:
         payload["dimensions"] = [{"name": name} for name in dimensions]
-    response = api_request(refresh_access_token(profile), "POST", f"{DATA_BASE}/properties/{property_id}:runReport", payload=payload)
-    rows = normalized_report(response, dimensions, metrics, profile, property_id)
+    response = api_request(access.token(), "POST", f"{DATA_BASE}/properties/{property_id}:runReport", payload=payload)
+    rows = normalized_report(response, dimensions, metrics, access, property_id)
     emit_report(rows, dimensions, metrics, args)
     warn_truncated(response_row_count(response, len(rows)) > len(rows), limit)
 
 
 def command_realtime(args: argparse.Namespace) -> None:
-    profile = get_profile(selected_profile_name(args))
+    access = selected_access(args)
     property_id = resource_id(args.property, "properties")
     limit = bounded_limit(args.limit, 250000)
     dimensions, metrics = dimension_metric_names(args)
     payload: Dict[str, Any] = {"metrics": [{"name": name} for name in metrics], "limit": str(limit)}
     if dimensions:
         payload["dimensions"] = [{"name": name} for name in dimensions]
-    response = api_request(refresh_access_token(profile), "POST", f"{DATA_BASE}/properties/{property_id}:runRealtimeReport", payload=payload)
-    rows = normalized_report(response, dimensions, metrics, profile, property_id)
+    response = api_request(access.token(), "POST", f"{DATA_BASE}/properties/{property_id}:runRealtimeReport", payload=payload)
+    rows = normalized_report(response, dimensions, metrics, access, property_id)
     emit_report(rows, dimensions, metrics, args)
     warn_truncated(response_row_count(response, len(rows)) > len(rows), limit)
 
@@ -776,7 +816,7 @@ def run_breakdown_report(
     metric_filter: Optional[Dict[str, Any]] = None,
     notes: Sequence[str] = (),
 ) -> None:
-    profile = get_profile(selected_profile_name(args))
+    access = selected_access(args)
     property_id = resource_id(args.property, "properties")
     limit = bounded_limit(args.limit)
     dimensions = list(breakdown.dimensions)
@@ -799,12 +839,12 @@ def run_breakdown_report(
     if metric_filter is not None:
         payload["metricFilter"] = metric_filter
     response = api_request(
-        refresh_access_token(profile),
+        access.token(),
         "POST",
         f"{DATA_BASE}/properties/{property_id}:runReport",
         payload=payload,
     )
-    rows = normalized_report(response, dimensions, metrics, profile, property_id)
+    rows = normalized_report(response, dimensions, metrics, access, property_id)
     emit_report(rows, dimensions, metrics, args)
     for note in notes:
         print(f"NOTE: {note}", file=sys.stderr)
@@ -854,8 +894,9 @@ def command_commerce(args: argparse.Namespace) -> None:
 
 
 def add_profile_option(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--env-file", help="Load an explicit dotenv after existing process variables")
-    parser.add_argument("--profile", help="Configured Google Analytics profile")
+    parser.add_argument("--profile", help="Which Google OAuth app profile Rundesk signed in with")
+    parser.add_argument("--email", help="Which signed-in Google account to use when Rundesk holds more than one")
+    parser.add_argument("--auth", action="store_true", help="Run `rundesk login google` first, with --profile when given")
     parser.add_argument("--json", action="store_true", help="Emit normalized JSON")
 
 
@@ -870,8 +911,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="google-analytics", description="Read bounded Google Analytics 4 data.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    profiles = subparsers.add_parser("profiles", help="List configured profiles without a network request")
-    profiles.add_argument("--env-file", help="Load an explicit dotenv after existing process variables")
+    profiles = subparsers.add_parser("profiles", help="List the Google accounts Rundesk holds, without a network request")
+    profiles.add_argument("--profile", help="OAuth app profile to list Rundesk's signed-in accounts for")
+    profiles.add_argument("--auth", action="store_true", help="Run `rundesk login google` first, with --profile when given")
     profiles.add_argument("--json", action="store_true", help="Emit normalized JSON")
     profiles.set_defaults(handler=command_profiles)
 
@@ -943,7 +985,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        load_environment(args.env_file)
         args.handler(args)
     except AnalyticsError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

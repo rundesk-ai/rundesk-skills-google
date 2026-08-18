@@ -21,29 +21,51 @@ google-merchant competitive-visibility --profile example --account 123456 \
   [--during LAST_30_DAYS] [--traffic-source organic]
 ```
 
-Every command accepts `--profile`, `--env-file`, `--json`, and, apart from `profiles`, `--limit`.
+Every command accepts `--profile`, `--email`, `--auth`, `--json`, and, apart from `profiles`,
+`--limit`.
 Reports allow at most 5,000 rows, `accounts` allows 2,000, and `status` and `issues` allow 1,000.
 Every read is bounded by `--limit`; truncation is reported on stderr.
 
-## Setup
+## Signing in
 
-Configure the values declared in `rundesk.json`:
+Rundesk owns Google sign-in. It holds the OAuth app configuration, runs the browser flow, keeps the
+grant sealed, and refreshes tokens. This package holds none of that and declares no credentials: it
+asks Rundesk for one short-lived access token over one end of a socket pair it creates itself,
+and uses that token as a request header only. The token never reaches an argument, an environment
+variable, a file, or any output.
 
 ```sh
-rundesk skills configure rundesk-skills-google/google-merchant
-rundesk skills configure rundesk-skills-google/google-merchant --profile example
+rundesk login google
+rundesk login google --profile acme
 ```
 
-| Value | Meaning |
-|---|---|
-| `GOOGLE_MERCHANT_CLIENT_ID` | OAuth 2.0 client ID for a Cloud project with the Merchant API enabled |
-| `GOOGLE_MERCHANT_CLIENT_SECRET` | the secret paired with that client ID |
-| `GOOGLE_MERCHANT_REFRESH_TOKEN` | a refresh token granted `https://www.googleapis.com/auth/content` |
+A *profile* is one OAuth app configuration, not a person. A single profile can hold several verified
+Google accounts; Rundesk keys each by Google's immutable subject identifier and selects it by email.
 
-Optional: `GOOGLE_MERCHANT_LABEL` names a profile in output, `GOOGLE_MERCHANT_PROFILES` lists
-profile names explicitly, and `GOOGLE_MERCHANT_ENV_FILE` points at a dotenv. Named profiles use
-Rundesk's `<NAME>__<PROFILE>` suffix form; the legacy `GOOGLE_MERCHANT_<PROFILE>_<FIELD>` infix form
-is still read, but a profile configured in both forms is refused as ambiguous.
+```text
+--profile <app-profile>   which OAuth app configuration to use; needed only when more than one exists
+--email <address>         which signed-in account to use; needed only when that profile holds several
+--auth                    run `rundesk login google` first, forwarding --profile, then continue
+```
+
+`profiles` lists the accounts Rundesk holds for one app profile and contacts Google for none of it.
+Missing sign-in, an unconfigured app profile, an ambiguous account, and a missing scope each name
+the exact command to run.
+
+Rundesk attaches this package's fixed scope to the token and widens consent in the browser itself
+when a grant is short:
+
+```text
+https://www.googleapis.com/auth/content   every command
+```
+
+The OAuth app Rundesk signs in with must belong to a Google Cloud project with the Merchant API
+enabled and Merchant API developer registration completed once by an account holding `ADMIN`; an
+unregistered project is rejected as unauthenticated, commonly with `AUTH_GCP_NOT_REGISTERED`.
+
+A Rundesk older than managed sign-in cannot answer at all; the command says so and says to update
+Rundesk. There is no other way to authorize this package: there is no client ID, client secret,
+refresh token, dotenv, or `--env-file` to configure.
 
 ### The scope is broader than this package
 
@@ -51,12 +73,10 @@ Google publishes exactly one Merchant API scope, `https://www.googleapis.com/aut
 is read-write. There is no read-only scope, so the consent screen says "Manage your product listings
 and accounts for Google Shopping" even though nothing here writes.
 
-Constrain the credential in Merchant Center instead. Grant the authorizing identity the `READ_ONLY`
+Constrain the account in Merchant Center instead. Grant the signed-in identity the `READ_ONLY`
 access right, which Google documents as access to the same read methods as `STANDARD` with no access
 to any mutating method. Add `PERFORMANCE_REPORTING` for `performance`. `API_DEVELOPER` identifies a
-technical contact; it does not grant account data access. The Cloud project must also complete
-Merchant API developer registration once, by an account holding `ADMIN`; an unregistered project is
-rejected as unauthenticated, commonly with `AUTH_GCP_NOT_REGISTERED`.
+technical contact; it does not grant account data access.
 
 ## Endpoints
 
@@ -163,7 +183,7 @@ are rendered as `YYYY-MM-DD`. A repeated field is joined with `|`.
 ## Failures
 
 Errors print to stderr as `ERROR: <message>` and exit 2. Google's own message is repeated when it
-sends one; tokens, secrets, and authorization headers never appear in output.
+sends one; access tokens and authorization headers never appear in output.
 
 Common causes: `PERMISSION_DENIED_TO_USE_MARKET_INSIGHTS` means the program is not enabled on the
 account; `PERMISSION_DENIED_NOT_ALLOWLISTED_TO_USE_PERFORMANCE_REPORTING` means the identity lacks
@@ -178,5 +198,5 @@ python3 skills/google-merchant/scripts/google-merchant.d/test-google-merchant.py
 skills/google-merchant/scripts/google-merchant --help
 ```
 
-Tests are offline: OAuth and every Merchant API boundary is replaced with synthetic fixtures, and no
-test contacts Google.
+Tests are offline: a stand-in Rundesk answers the sign-in bridge exactly as the real one documents
+it, synthetic fixtures replace every Merchant API boundary, and no test contacts Google.

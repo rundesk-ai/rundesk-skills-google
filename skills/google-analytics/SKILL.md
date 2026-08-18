@@ -1,23 +1,30 @@
 ---
 name: google-analytics
-description: Use when the user needs to inspect Google Analytics 4 accounts or properties; understand where site traffic and sessions come from; break traffic down by channel, source, campaign, landing page, geography, device, or aggregated age and gender; measure leads and other key events; review ecommerce product, purchase, and revenue behavior; or run a bounded historical or realtime GA4 metric query. It supplies read-only GA4 discovery and reporting through explicitly selected credential profiles and properties. Do not use for Universal Analytics, tag or ecommerce implementation, Google Ads, Merchant Center product feeds, Search Console, Analytics Admin change history, or Analytics configuration changes.
+description: Use when the user needs to inspect Google Analytics 4 accounts or properties; understand where site traffic and sessions come from; break traffic down by channel, source, campaign, landing page, geography, device, or aggregated age and gender; measure leads and other key events; review ecommerce product, purchase, and revenue behavior; or run a bounded historical or realtime GA4 metric query. It supplies read-only GA4 discovery and reporting through an explicitly selected Google account and property. Do not use for Universal Analytics, tag or ecommerce implementation, Google Ads, Merchant Center product feeds, Search Console, Analytics Admin change history, or Analytics configuration changes.
 ---
 
 # Google Analytics
 
-Run `$RUNDESK_SKILLS/google-analytics/scripts/google-analytics`; it resolves credentials itself, so
-never inspect or print their source. Read `references/cli.md` for setup, environment keys, report
-arguments, breakdown fields, output fields, or validation.
+Run `$RUNDESK_SKILLS/google-analytics/scripts/google-analytics`. Rundesk owns Google sign-in and
+hands the command one short-lived token, so never ask for or print a credential. Read
+`references/cli.md` for signing in, report arguments, breakdown fields, output fields, or validation.
 
-Start with `profiles`, then discover the accounts and properties visible to the selected identity:
+Start with `profiles`, which shows the accounts Rundesk holds and needs no network, then discover
+what the selected account can reach:
 
 ```sh
 "$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" profiles
-"$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" accounts --profile <profile> --limit 25
-"$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" properties --profile <profile> --limit 50
+"$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" accounts --profile <app-profile> --email <address> --limit 25
+"$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" properties --profile <app-profile> --limit 50
 ```
 
-Never guess a profile or property. Use the exact numeric property ID returned by `properties`.
+`--profile` names a Google OAuth app profile and `--email` names one signed-in account within it;
+both are needed only when Rundesk holds more than one. When nothing is connected, the command says
+so and names the command to run. Ask the owner to run `rundesk login google` in their own terminal,
+or pass `--auth` to run that sign-in from here when a browser is available.
+
+Never guess a profile, an account, or a property. Use the exact numeric property ID returned by
+`properties`.
 
 ## Answer the common questions with the bounded reports
 

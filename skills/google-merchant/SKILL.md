@@ -1,20 +1,26 @@
 ---
 name: google-merchant
-description: Use when the user needs to inspect a Google Merchant Center account for a shopping site; see which products are eligible, pending, or disapproved on Shopping ads and free listings; diagnose item-level feed issues and what is suppressing products; measure product impressions, clicks, click-through rate, and conversions segmented by date, product, brand, category, country, marketing method, or store type; or review Google's price benchmarks, suggested prices, best sellers, and competitive visibility. It supplies read-only Merchant Center discovery, product status, issue diagnostics, and bounded performance reporting through explicitly selected credential profiles and accounts. Do not use for editing products, feeds, inventory, promotions, or account settings, nor for Google Analytics, Search Console, or Google Ads.
+description: Use when the user needs to inspect a Google Merchant Center account for a shopping site; see which products are eligible, pending, or disapproved on Shopping ads and free listings; diagnose item-level feed issues and what is suppressing products; measure product impressions, clicks, click-through rate, and conversions segmented by date, product, brand, category, country, marketing method, or store type; or review Google's price benchmarks, suggested prices, best sellers, and competitive visibility. It supplies read-only Merchant Center discovery, product status, issue diagnostics, and bounded performance reporting through an explicitly selected Google account and Merchant Center account. Do not use for editing products, feeds, inventory, promotions, or account settings, nor for Google Analytics, Search Console, or Google Ads.
 ---
 
 # Google Merchant Center
 
-Run `$RUNDESK_SKILLS/google-merchant/scripts/google-merchant`; it resolves credentials itself, so
-never inspect or print their source. Read `references/cli.md` for setup, environment keys, report
-arguments, breakdown fields, output fields, or validation.
+Run `$RUNDESK_SKILLS/google-merchant/scripts/google-merchant`. Rundesk owns Google sign-in and
+hands the command one short-lived token, so never ask for or print a credential. Read
+`references/cli.md` for signing in, report arguments, breakdown fields, output fields, or validation.
 
-Start with `profiles`, then discover the accounts the selected identity can reach:
+Start with `profiles`, which shows the accounts Rundesk holds and needs no network, then discover
+the Merchant Center accounts the selected account can reach:
 
 ```sh
 "$RUNDESK_SKILLS/google-merchant/scripts/google-merchant" profiles
-"$RUNDESK_SKILLS/google-merchant/scripts/google-merchant" accounts --profile <profile> --limit 25
+"$RUNDESK_SKILLS/google-merchant/scripts/google-merchant" accounts --profile <app-profile> --email <address> --limit 25
 ```
+
+`--profile` names a Google OAuth app profile and `--email` names one signed-in account within it;
+both are needed only when Rundesk holds more than one. When nothing is connected, the command says
+so and names the command to run. Ask the owner to run `rundesk login google` in their own terminal,
+or pass `--auth` to run that sign-in from here when a browser is available.
 
 Never guess a profile or account. Every other command requires `--account` with the exact numeric
 Merchant Center account ID that `accounts` returned. Reporting works for standalone accounts and

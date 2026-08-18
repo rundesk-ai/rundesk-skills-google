@@ -92,66 +92,46 @@ Google signals and are thresholded by Google.
 Analytics reports the property's own measurement. Merchant Center product feeds and Google Ads cost
 are separate products with separate APIs and are not reachable through this package.
 
-## Credentials and profiles
+## Signing in
 
-The integration calls Google directly through HTTPS and requests only
-`https://www.googleapis.com/auth/analytics.readonly`. The OAuth client must belong to a Google Cloud
-project where the Google Analytics Data API and Google Analytics Admin API are enabled. The Google
-identity that granted the refresh token must have access to the requested Analytics resources.
+Rundesk owns Google sign-in. It holds the OAuth app configuration, runs the browser flow, keeps the
+grant sealed, and refreshes tokens. This package holds none of that and declares no credentials: it
+asks Rundesk for one short-lived access token over one end of a socket pair it creates itself,
+and uses that token as a request header only. The token never reaches an argument, an environment
+variable, a file, or any output.
 
-For the initial manual setup, create a web OAuth client with
-`https://developers.google.com/oauthplayground` as an authorized redirect URI. In Google's OAuth
-2.0 Playground, enable **Use your own OAuth credentials**, choose server-side and offline access,
-authorize `https://www.googleapis.com/auth/analytics.readonly` as the intended Google user, and
-exchange the code for a refresh token. Enter the three values only through
-`rundesk skills configure` in the owner's terminal. Do not send them through chat or save a
-Playground link containing credentials or tokens.
+```sh
+rundesk login google
+rundesk login google --profile acme
+```
 
-An external OAuth consent screen left in **Testing** normally issues refresh tokens that expire in
-seven days for this scope. Publish the app appropriately or expect to reconnect after the testing
-token expires. Revocation, inactivity, Workspace policy, and Google's per-user token limits can
-also invalidate a refresh token.
-
-Required, per `rundesk.json`:
+A *profile* is one OAuth app configuration, not a person. A single profile can hold several verified
+Google accounts; Rundesk keys each by Google's immutable subject identifier and selects it by email.
 
 ```text
-GOOGLE_ANALYTICS_CLIENT_ID
-GOOGLE_ANALYTICS_CLIENT_SECRET
-GOOGLE_ANALYTICS_REFRESH_TOKEN
+--profile <app-profile>   which OAuth app configuration to use; needed only when more than one exists
+--email <address>         which signed-in account to use; needed only when that profile holds several
+--auth                    run `rundesk login google` first, forwarding --profile, then continue
 ```
 
-Rundesk-managed profiles append `__<PROFILE>`:
+`profiles` lists the accounts Rundesk holds for one app profile and contacts Google for none of it.
+Missing sign-in, an unconfigured app profile, an ambiguous account, and a missing scope each name
+the exact command to run.
 
-```dotenv
-GOOGLE_ANALYTICS_CLIENT_ID=
-GOOGLE_ANALYTICS_CLIENT_SECRET=
-GOOGLE_ANALYTICS_REFRESH_TOKEN=
+Rundesk attaches this package's fixed scope to the token and widens consent in the browser itself
+when a grant is short:
 
-GOOGLE_ANALYTICS_CLIENT_ID__EXAMPLE=
-GOOGLE_ANALYTICS_CLIENT_SECRET__EXAMPLE=
-GOOGLE_ANALYTICS_REFRESH_TOKEN__EXAMPLE=
-GOOGLE_ANALYTICS_LABEL__EXAMPLE=Example Analytics
+```text
+https://www.googleapis.com/auth/analytics.readonly   every command
 ```
 
-The older dotenv spelling remains supported:
+The OAuth app Rundesk signs in with must belong to a Google Cloud project where the Google Analytics
+Data API and Google Analytics Admin API are enabled, and the account that signs in must be able to
+reach the requested Analytics resources.
 
-```dotenv
-GOOGLE_ANALYTICS_PROFILES=example
-GOOGLE_ANALYTICS_DEFAULT_PROFILE=example
-GOOGLE_ANALYTICS_EXAMPLE_CLIENT_ID=
-GOOGLE_ANALYTICS_EXAMPLE_CLIENT_SECRET=
-GOOGLE_ANALYTICS_EXAMPLE_REFRESH_TOKEN=
-GOOGLE_ANALYTICS_EXAMPLE_LABEL=Example Analytics
-```
-
-Configuration is resolved in this order: process environment, `--env-file`,
-`GOOGLE_ANALYTICS_ENV_FILE`, `RUNDESK_INTEGRATIONS_ENV`, the isolated Rundesk integrations path,
-then the legacy integration path. Existing process variables always win. Named profiles never fall
-back to unsuffixed credentials.
-
-Restrict dotenv files to their owner with `chmod 600`. The CLI warns about broader permissions and
-never prints tokens, client secrets, authorization headers, or dotenv contents. Access tokens are
-kept in memory for the current invocation only.
+A Rundesk older than managed sign-in cannot answer at all; the command says so and says to update
+Rundesk. There is no other way to authorize this package: there is no client ID, client secret,
+refresh token, dotenv, or `--env-file` to configure.
 
 ## Output
 
@@ -184,8 +164,10 @@ python3 "$RUNDESK_SKILLS/google-analytics/scripts/google-analytics.d/test-google
 "$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" profiles
 ```
 
-The test suite is offline and uses synthetic responses. Optional live smoke tests should stop after
-bounded `accounts`, `properties`, and one small report. This package has no mutation command.
+The test suite is offline: a stand-in Rundesk answers the sign-in bridge exactly as the real one
+documents it, and synthetic responses stand in for Google. Optional live smoke tests should stop
+after bounded `accounts`, `properties`, and one small report. This package has no mutation
+command.
 
 ## Official references
 

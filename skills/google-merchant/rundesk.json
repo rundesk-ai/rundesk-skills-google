@@ -1,7 +1,0 @@
-{
-  "needs": {
-    "GOOGLE_MERCHANT_CLIENT_ID": "the OAuth 2.0 client ID for a Google Cloud project with the Merchant API enabled",
-    "GOOGLE_MERCHANT_CLIENT_SECRET": "the OAuth 2.0 client secret paired with GOOGLE_MERCHANT_CLIENT_ID",
-    "GOOGLE_MERCHANT_REFRESH_TOKEN": "an OAuth refresh token granted the https://www.googleapis.com/auth/content scope by a user with access to the Merchant Center account"
-  }
-}

@@ -7,8 +7,11 @@ import importlib.util
 import io
 import json
 import os
+import socket
+import struct
 import subprocess
 import sys
+import time
 import tempfile
 import datetime as dt
 import unittest
@@ -55,116 +58,19 @@ class RawResponse(Response):
         return self.payload
 
 
+class StubAccess:
+    """An account Rundesk has already granted, so a case can start at the Google boundary."""
+
+    name = "example"
+
+    def token(self):
+        return "access"
+
+
 class SearchConsoleTest(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
-        self.env = {
-            "GOOGLE_SEARCH_CONSOLE_CLIENT_ID__EXAMPLE": "client",
-            "GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET__EXAMPLE": "secret",
-            "GOOGLE_SEARCH_CONSOLE_REFRESH_TOKEN__EXAMPLE": "refresh",
-            "GOOGLE_SEARCH_CONSOLE_LABEL__EXAMPLE": "Example Search Console",
-        }
-        self.profile = self.module.Profile("example", "client", "secret", "refresh", "Example")
-
-    def test_profiles_discovers_rundesk_account_without_network(self):
-        with patch.dict(os.environ, self.env, clear=True), patch.object(
-            self.module.urllib.request, "urlopen", side_effect=AssertionError("network")
-        ), redirect_stdout(io.StringIO()) as output:
-            code = self.module.main(["profiles"])
-        self.assertEqual(code, 0)
-        self.assertIn("example,Example Search Console,ready", output.getvalue())
-
-    def test_named_profile_never_falls_back_to_plain_credentials(self):
-        env = {
-            "GOOGLE_SEARCH_CONSOLE_CLIENT_ID": "plain-client",
-            "GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET": "plain-secret",
-            "GOOGLE_SEARCH_CONSOLE_REFRESH_TOKEN": "plain-refresh",
-            "GOOGLE_SEARCH_CONSOLE_CLIENT_ID__EXAMPLE": "named-client",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            with self.assertRaises(self.module.SearchConsoleError) as raised:
-                self.module.get_profile("example")
-        self.assertIn("CLIENT_SECRET__EXAMPLE", str(raised.exception))
-        self.assertNotIn("plain-secret", str(raised.exception))
-
-    def test_default_profile_setting_does_not_reassign_plain_credentials(self):
-        env = {
-            "GOOGLE_SEARCH_CONSOLE_DEFAULT_PROFILE": "example",
-            "GOOGLE_SEARCH_CONSOLE_CLIENT_ID": "plain-client",
-            "GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET": "plain-secret",
-            "GOOGLE_SEARCH_CONSOLE_REFRESH_TOKEN": "plain-refresh",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            with self.assertRaises(self.module.SearchConsoleError):
-                self.module.get_profile("example")
-            with self.assertRaisesRegex(self.module.SearchConsoleError, "letter or digit"):
-                self.module.get_profile("---")
-
-    def test_profile_credentials_never_mix_rundesk_and_legacy_forms(self):
-        env = {
-            "GOOGLE_SEARCH_CONSOLE_CLIENT_ID__EXAMPLE": "suffix-client",
-            "GOOGLE_SEARCH_CONSOLE_EXAMPLE_CLIENT_SECRET": "legacy-secret",
-            "GOOGLE_SEARCH_CONSOLE_EXAMPLE_REFRESH_TOKEN": "legacy-refresh",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            with self.assertRaisesRegex(self.module.SearchConsoleError, "both Rundesk suffix and legacy"):
-                self.module.get_profile("example")
-
-    def test_missing_legacy_credential_uses_the_legacy_variable_name(self):
-        env = {
-            "GOOGLE_SEARCH_CONSOLE_EXAMPLE_CLIENT_ID": "legacy-client",
-            "GOOGLE_SEARCH_CONSOLE_EXAMPLE_CLIENT_SECRET": "legacy-secret",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            with self.assertRaises(self.module.SearchConsoleError) as raised:
-                self.module.get_profile("example")
-        self.assertIn("GOOGLE_SEARCH_CONSOLE_EXAMPLE_REFRESH_TOKEN", str(raised.exception))
-        self.assertNotIn("REFRESH_TOKEN__EXAMPLE", str(raised.exception))
-
-    def test_plain_credentials_create_default_profile(self):
-        env = {
-            "GOOGLE_SEARCH_CONSOLE_CLIENT_ID": "client",
-            "GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET": "secret",
-            "GOOGLE_SEARCH_CONSOLE_REFRESH_TOKEN": "refresh",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            self.assertEqual(self.module.discovered_profiles(), ["default"])
-            self.assertEqual(self.module.get_profile("default").client_id, "client")
-
-    def test_dotenv_preserves_unmatched_quotes_and_rejects_invalid_keys(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "env"
-            path.write_text(
-                "GOOGLE_SEARCH_CONSOLE_CLIENT_ID=value'\n"
-                "export GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET=ignored\n",
-                encoding="utf-8",
-            )
-            path.chmod(0o600)
-            with patch.dict(os.environ, {}, clear=True):
-                self.module.load_dotenv(path)
-                self.assertEqual(os.environ["GOOGLE_SEARCH_CONSOLE_CLIENT_ID"], "value'")
-                self.assertNotIn("export GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET", os.environ)
-
-    def test_explicit_missing_env_file_is_refused(self):
-        missing = "/tmp/rundesk-google-search-console-does-not-exist"
-        with patch.dict(os.environ, {}, clear=True), redirect_stderr(io.StringIO()) as error:
-            code = self.module.main(["profiles", "--env-file", missing])
-        self.assertEqual(code, 2)
-        self.assertIn("does not exist", error.getvalue())
-
-    def test_token_refresh_posts_credentials_without_printing_them(self):
-        requests = []
-
-        def opener(request, timeout):
-            requests.append(request)
-            return Response({"access_token": "access"})
-
-        self.assertEqual(self.module.access_token(self.profile, opener=opener), "access")
-        request = requests[0]
-        body = request.data.decode()
-        self.assertIn("client_id=client", body)
-        self.assertIn("refresh_token=refresh", body)
-        self.assertNotIn("secret", repr(self.profile))
+        self.access = StubAccess()
 
     def test_request_error_exposes_google_message_but_not_authorization(self):
         error = urllib.error.HTTPError(
@@ -198,11 +104,11 @@ class SearchConsoleTest(unittest.TestCase):
             {"siteUrl": "sc-domain:example.test", "permissionLevel": "siteOwner"},
             {"siteUrl": "https://www.example.test/", "permissionLevel": "siteRestrictedUser"},
         ]}
-        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
             self.module, "api", return_value=payload
         ) as call, redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
             self.module.cmd_sites(args)
-        call.assert_called_once_with(self.profile, "/sites")
+        call.assert_called_once_with(self.access, "/sites")
         self.assertIn("sc-domain:example.test", output.getvalue())
         self.assertNotIn("www.example.test", output.getvalue())
         self.assertIn("truncated", error.getvalue())
@@ -214,7 +120,7 @@ class SearchConsoleTest(unittest.TestCase):
             dimension=["query", "page"], search_type="web", filter=[], limit=10, json=True,
         )
         payload = {"rows": [{"keys": ["example", "https://www.example.test/page"], "clicks": 3, "impressions": 20, "ctr": 0.15, "position": 4.2}]}
-        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
             self.module, "api", return_value=payload
         ) as call, redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
             self.module.cmd_performance(args)
@@ -231,7 +137,7 @@ class SearchConsoleTest(unittest.TestCase):
             start_date="2026-07-01", end_date="2026-07-31",
             dimension=["query"], search_type=None, filter=[], limit=1, json=False,
         )
-        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
             self.module, "api", return_value={"rows": [{"keys": ["example"]}]}
         ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
             self.module.cmd_performance(args)
@@ -240,7 +146,7 @@ class SearchConsoleTest(unittest.TestCase):
     def test_inspect_url_uses_inspection_api_and_normalizes_result(self):
         args = SimpleNamespace(profile="example", site="sc-domain:example.test", url="https://example.test/page", json=True)
         payload = {"inspectionResult": {"indexStatusResult": {"verdict": "PASS", "coverageState": "Submitted and indexed", "lastCrawlTime": "2026-08-01T12:00:00Z"}}}
-        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
             self.module, "api", return_value=payload
         ) as call, redirect_stdout(io.StringIO()) as output:
             self.module.cmd_inspect(args)
@@ -255,7 +161,7 @@ class SearchConsoleTest(unittest.TestCase):
             url="https://example.test/page",
             json=True,
         )
-        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
             self.module, "api", return_value={}
         ):
             with self.assertRaisesRegex(self.module.SearchConsoleError, "no URL inspection result"):
@@ -264,7 +170,7 @@ class SearchConsoleTest(unittest.TestCase):
     def test_sitemaps_lists_compact_fields(self):
         args = SimpleNamespace(profile="example", site="sc-domain:example.test", limit=2, json=False)
         payload = {"sitemap": [{"path": "https://example.test/sitemap.xml", "type": "sitemap", "isPending": False, "errors": "0", "warnings": "1"}]}
-        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
             self.module, "api", return_value=payload
         ), redirect_stdout(io.StringIO()) as output:
             self.module.cmd_sitemaps(args)
@@ -326,14 +232,6 @@ class SearchConsoleTest(unittest.TestCase):
                         opener=lambda *args, **kwargs: RawResponse(body),
                     )
 
-    def test_token_refresh_refuses_non_object_and_non_string_tokens(self):
-        with self.assertRaisesRegex(self.module.SearchConsoleError, "malformed OAuth token response"):
-            self.module.access_token(self.profile, opener=lambda *a, **k: RawResponse(b"[]"))
-        with self.assertRaisesRegex(self.module.SearchConsoleError, "no access token"):
-            self.module.access_token(
-                self.profile, opener=lambda *a, **k: Response({"access_token": {"value": "x"}})
-            )
-
     def test_commands_refuse_wrong_collection_and_object_shapes(self):
         sites = SimpleNamespace(profile="example", limit=5, json=False)
         performance = SimpleNamespace(
@@ -352,16 +250,14 @@ class SearchConsoleTest(unittest.TestCase):
         )
         for command, args, payload, expected in cases:
             with self.subTest(command=command.__name__, payload=payload):
-                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
                     self.module, "api", return_value=payload
                 ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     with self.assertRaisesRegex(self.module.SearchConsoleError, expected):
                         command(args)
 
     def test_malformed_response_exits_two_instead_of_raising(self):
-        with patch.dict(os.environ, self.env, clear=True), patch.object(
-            self.module, "access_token", return_value="token"
-        ), patch.object(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
             self.module, "open_url", side_effect=lambda *a, **k: RawResponse(b"<html>not json</html>")
         ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
             code = self.module.main(["sites", "--profile", "example"])
@@ -370,7 +266,7 @@ class SearchConsoleTest(unittest.TestCase):
         self.assertNotIn("Traceback", error.getvalue())
 
     def test_main_rejects_unbounded_limit_before_network(self):
-        with patch.dict(os.environ, self.env, clear=True), redirect_stderr(io.StringIO()) as error:
+        with patch.dict(os.environ, {}, clear=True), redirect_stderr(io.StringIO()) as error:
             code = self.module.main(["sites", "--profile", "example", "--limit", "1001"])
         self.assertEqual(code, 2)
         self.assertIn("between 1 and 1000", error.getvalue())
@@ -384,7 +280,7 @@ class SearchConsoleTest(unittest.TestCase):
         return SimpleNamespace(**values)
 
     def performance_body(self, args, payload=None):
-        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
             self.module, "api", return_value=payload if payload is not None else {"rows": []}
         ) as call, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.module.cmd_performance(args)
@@ -445,9 +341,9 @@ class SearchConsoleTest(unittest.TestCase):
             return Response({"rows": []})
 
         args = self.performance_args(filter=["page:includingRegex:^/blog/.*$", "query:contains:caf\u00e9 & 100%"])
-        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
-            self.module, "access_token", return_value="access"
-        ), patch.object(self.module, "open_url", side_effect=opener), redirect_stdout(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
+            self.module, "open_url", side_effect=opener
+        ), redirect_stdout(
             io.StringIO()
         ), redirect_stderr(io.StringIO()):
             self.module.cmd_performance(args)
@@ -489,13 +385,13 @@ class SearchConsoleTest(unittest.TestCase):
         for value, expected in cases:
             with self.subTest(filter=value[:40]):
                 with patch.object(
-                    self.module, "selected_profile", side_effect=AssertionError("configuration")
+                    self.module, "selected_access", side_effect=AssertionError("configuration")
                 ), patch.object(self.module, "api", side_effect=AssertionError("network")):
                     with self.assertRaisesRegex(self.module.SearchConsoleError, expected):
                         self.module.cmd_performance(self.performance_args(filter=[value]))
 
     def test_main_rejects_a_malformed_filter_without_contacting_google(self):
-        with patch.dict(os.environ, self.env, clear=True), patch.object(
+        with patch.dict(os.environ, {}, clear=True), patch.object(
             self.module.urllib.request, "urlopen", side_effect=AssertionError("network")
         ), redirect_stderr(io.StringIO()) as error:
             code = self.module.main([
@@ -506,10 +402,8 @@ class SearchConsoleTest(unittest.TestCase):
         self.assertIn("operator 'like'", error.getvalue())
 
     def test_submit_sitemap_previews_without_reaching_google_and_refuses(self):
-        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
             self.module, "api", side_effect=AssertionError("network")
-        ), patch.object(
-            self.module, "access_token", side_effect=AssertionError("network")
         ), patch.object(
             self.module, "open_url", side_effect=AssertionError("network")
         ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
@@ -528,7 +422,7 @@ class SearchConsoleTest(unittest.TestCase):
     def test_submit_sitemap_preview_exits_two_in_both_output_modes(self):
         for extra in ([], ["--json"]):
             with self.subTest(json=bool(extra)):
-                with patch.dict(os.environ, self.env, clear=True), patch.object(
+                with patch.dict(os.environ, {}, clear=True), patch.object(
                     self.module.urllib.request, "urlopen", side_effect=AssertionError("network")
                 ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
                     code = self.module.main([
@@ -547,16 +441,16 @@ class SearchConsoleTest(unittest.TestCase):
             "path": "https://www.example.test/sitemap.xml", "type": "sitemap", "isPending": True,
             "lastSubmitted": "2026-08-17T00:00:00.000Z", "warnings": 0, "errors": 0,
         }
-        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
             self.module, "api", side_effect=[{}, entry]
         ) as call, redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
             self.module.cmd_submit_sitemap(self.submit_args(confirm=True, json=True))
         expected = ("/sites/https%3A%2F%2Fwww.example.test%2F"
                     "/sitemaps/https%3A%2F%2Fwww.example.test%2Fsitemap.xml")
         submit, verify = call.call_args_list
-        self.assertEqual((self.profile, expected), submit.args)
+        self.assertEqual((self.access, expected), submit.args)
         self.assertEqual({"method": "PUT"}, submit.kwargs)
-        self.assertEqual((self.profile, expected), verify.args)
+        self.assertEqual((self.access, expected), verify.args)
         self.assertEqual({}, verify.kwargs)
         row = json.loads(output.getvalue())[0]
         self.assertEqual("submitted", row["state"])
@@ -566,7 +460,7 @@ class SearchConsoleTest(unittest.TestCase):
     def test_submit_sitemap_refuses_to_report_success_it_cannot_verify(self):
         for payload in ({}, {"path": ""}, {"path": 7}, {"errors": 0}):
             with self.subTest(payload=payload):
-                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
                     self.module, "api", side_effect=[{}, payload]
                 ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     with self.assertRaisesRegex(
@@ -577,7 +471,7 @@ class SearchConsoleTest(unittest.TestCase):
     def test_submit_sitemap_refuses_a_malformed_verification_response(self):
         for payload in ([], "ok", 7, None):
             with self.subTest(payload=payload):
-                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
                     self.module, "api", side_effect=[{}, payload]
                 ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     with self.assertRaisesRegex(
@@ -586,7 +480,7 @@ class SearchConsoleTest(unittest.TestCase):
                         self.module.cmd_submit_sitemap(self.submit_args(confirm=True))
 
     def test_submit_sitemap_reports_a_path_google_rewrote(self):
-        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
             self.module, "api", side_effect=[{}, {"path": "https://www.example.test/sitemap_index.xml"}]
         ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
             self.module.cmd_submit_sitemap(self.submit_args(confirm=True))
@@ -600,7 +494,7 @@ class SearchConsoleTest(unittest.TestCase):
                  "https://user:password@example.test/sitemap.xml")
         for value in cases:
             with self.subTest(sitemap=value):
-                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
                     self.module, "api", side_effect=AssertionError("network")
                 ), redirect_stderr(io.StringIO()):
                     with self.assertRaisesRegex(
@@ -616,7 +510,7 @@ class SearchConsoleTest(unittest.TestCase):
         )
         for site, sitemap, warns in cases:
             with self.subTest(site=site, sitemap=sitemap):
-                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
                     self.module, "api", side_effect=[{}, {"path": sitemap}]
                 ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
                     self.module.cmd_submit_sitemap(
@@ -667,6 +561,399 @@ class SearchConsoleTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Google Search Console", result.stdout)
+
+
+# A stand-in for the Rundesk CLI that answers the hidden `_google` bridge exactly as Rundesk
+# documents it, including the checks Rundesk makes on the response descriptor before it writes.
+# Every case below therefore fails if this package sends the wrong words, the wrong capability, or a
+# descriptor Rundesk would refuse.
+FAKE_RUNDESK = '''#!{python}
+import json
+import os
+import socket
+import stat
+import struct
+import sys
+import time
+
+MAX_FRAME = 65536
+CAPABILITIES = ("analytics", "merchant", "search-console")
+plan = json.loads(os.environ["FAKE_RUNDESK_PLAN"])
+argv = sys.argv[1:]
+with open(plan["record"], "a", encoding="utf-8") as record:
+    record.write(json.dumps(argv) + chr(10))
+
+
+def refuse(said, code=1):
+    print(said, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def option(name):
+    return argv[argv.index(name) + 1] if name in argv else ""
+
+
+if plan["mode"] == "old":
+    print("usage: rundesk [-h] {{agents,ask,env}} ...", file=sys.stderr)
+    print("rundesk: error: argument command: invalid choice: %r (choose from 'agents', 'ask')"
+          % argv[0], file=sys.stderr)
+    raise SystemExit(2)
+
+if argv[0] == "login":
+    if argv[1] != "google":
+        refuse("rundesk: error: argument login_provider: invalid choice: %r" % argv[1], 2)
+    if plan["mode"] == "login-hang":
+        time.sleep(600)
+    if plan["mode"] == "login-refused":
+        refuse("login: FAILED — Google login was declined; no profile was changed")
+    print("Connected owner@example.test")
+    raise SystemExit(0)
+
+if argv[0] != "_google":
+    refuse("rundesk: error: argument command: invalid choice: %r" % argv[0], 2)
+
+fd = int(option("--response-fd"))
+if fd in (0, 1, 2) or fd < 0:
+    refuse("google: FAILED — the response FD must be inherited and may not be stdin, stdout, or stderr")
+try:
+    kind = os.fstat(fd).st_mode
+    checked = socket.socket(fileno=os.dup(fd))
+except OSError:
+    refuse("google: FAILED — the response FD is not an open socket")
+try:
+    if (not stat.S_ISSOCK(kind) or checked.family != socket.AF_UNIX
+            or checked.getsockname() not in ("", b"") or checked.getpeername() not in ("", b"")):
+        refuse("google: FAILED — the response FD must be a connected anonymous local socket")
+except OSError:
+    refuse("google: FAILED — the response FD must be a connected anonymous local socket")
+finally:
+    checked.close()
+
+held = plan["accounts"].get(option("--profile").strip().upper() or "DEFAULT")
+if held is None:
+    refuse("google: FAILED — set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET with "
+           "`rundesk env set` for this OAuth app profile")
+
+
+def answer(payload):
+    if plan["mode"] == "silent":
+        raise SystemExit(0)
+    if plan["mode"] == "hang":
+        time.sleep(600)
+    if plan["mode"] == "garbage":
+        body = b"{{not json"
+    else:
+        body = json.dumps(dict(payload, version=plan.get("version", 1)),
+                          separators=(",", ":")).encode("utf-8")
+    if len(body) > MAX_FRAME:
+        refuse("google: FAILED — the response is too large for the Google protocol")
+    os.write(fd, struct.pack(">I", len(body)) + body)
+    if plan["mode"] == "frame-then-hang":
+        time.sleep(600)
+    raise SystemExit(0)
+
+
+if argv[1] == "accounts":
+    answer({{"ok": True, "accounts": sorted(held)}})
+
+if argv[1] != "access":
+    refuse("rundesk: error: argument google_action: invalid choice: %r" % argv[1], 2)
+if argv[2] not in CAPABILITIES:
+    refuse("rundesk: error: argument capability: invalid choice: %r (choose from %s)"
+           % (argv[2], ", ".join(repr(one) for one in CAPABILITIES)), 2)
+if plan["mode"] == "scope":
+    refuse("google: FAILED — Google did not return a reusable grant for every requested scope")
+
+wanted = option("--email")
+matched = [name for name in held
+           if not wanted or name.casefold() == wanted.casefold()]
+if not matched:
+    refuse("google: FAILED — no matching Google profile is connected; run `rundesk login google`")
+if len(matched) != 1:
+    refuse("google: FAILED — more than one Google profile is connected; choose --email from: "
+           + ", ".join(sorted(matched)))
+# Derived here rather than carried in the plan, so no token this package handles is ever a
+# value in the environment the case runs with.
+email = matched[0]
+expiry = -60 if plan["mode"] == "expired" else 3600
+answer({{"ok": True, "access_token": "access-token-for-" + email,
+        "expires_at": int(plan["now"]) + expiry, "email": email, "sub": "sub-" + email}})
+'''.format(python=sys.executable)
+
+
+#: What the stand-in above hands back for the account these cases sign in as.
+MANAGED_TOKEN = "access-token-for-owner@example.test"
+
+
+class RundeskBridgeTest(unittest.TestCase):
+    """The catalog side of Rundesk-managed Google sign-in, against a faithful stand-in CLI."""
+
+    def setUp(self):
+        self.module = load_module()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.home = Path(home.name)
+        self.record = self.home / "argv.jsonl"
+        self.command = self.home / "rundesk"
+        self.command.write_text(FAKE_RUNDESK, encoding="utf-8")
+        self.command.chmod(0o755)
+        self.plan = {
+            "record": str(self.record),
+            "mode": "ok",
+            "now": int(time.time()),
+            "accounts": {"DEFAULT": ["owner@example.test"]},
+        }
+        self.requests = []
+        self.payloads = []
+
+    def opener(self, request, timeout=30):
+        self.requests.append(request)
+        return Response(self.payloads.pop(0) if self.payloads else {})
+
+    def environment(self, **extra):
+        env = {
+            "HOME": str(self.home),
+            "XDG_CONFIG_HOME": str(self.home / "config"),
+            "PATH": os.environ.get("PATH", os.defpath),
+            "RUNDESK_COMMAND": str(self.command),
+            "FAKE_RUNDESK_PLAN": json.dumps(self.plan),
+        }
+        env.update(extra)
+        return env
+
+    def invoke(self, argv, **extra):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, self.environment(**extra), clear=True), patch.object(
+            self.module, "open_url", self.opener
+        ), redirect_stdout(out), redirect_stderr(err):
+            code = self.module.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def asked(self):
+        if not self.record.exists():
+            return []
+        return [json.loads(line) for line in self.record.read_text(encoding="utf-8").splitlines()]
+
+    def sites_payload(self):
+        return {"siteEntry": [{"siteUrl": "https://example.test/", "permissionLevel": "siteOwner"}]}
+
+    def authorization(self):
+        return [request.get_header("Authorization") for request in self.requests]
+
+    # --- the protocol itself ------------------------------------------------------------------
+
+    def test_access_is_asked_for_over_an_inherited_pipe_and_used_only_as_a_header(self):
+        self.payloads = [self.sites_payload()]
+        code, out, err = self.invoke(["sites"])
+        self.assertEqual(0, code, err)
+        asked = self.asked()
+        self.assertEqual(1, len(asked))
+        self.assertEqual(["_google", "access", "search-console", "--response-fd"], asked[0][:4])
+        # The stand-in makes Rundesk's own check, so passing proves an inherited connected unnamed
+        # local socket rather than 0, 1, 2, a pipe, a named socket, or a file.
+        self.assertGreater(int(asked[0][4]), 2)
+        self.assertEqual(["Bearer " + MANAGED_TOKEN], self.authorization())
+        self.assertIn("https://example.test/", out)
+
+    def pair(self):
+        """One socket pair, closed however the case ends."""
+        ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        return ours, theirs
+
+    def test_frame_must_be_version_one_json_of_the_documented_size(self):
+        for body, expected in (
+            (json.dumps({"version": 2, "ok": True}).encode(), "version this package cannot read"),
+            (json.dumps({"version": 1, "ok": False}).encode(), "refused the Google request"),
+            (b"{not json", "malformed Google response"),
+        ):
+            with self.subTest(body=body):
+                ours, theirs = self.pair()
+                theirs.sendall(struct.pack(">I", len(body)) + body)
+                theirs.close()
+                with self.assertRaisesRegex(self.module.SearchConsoleError, expected):
+                    self.module.read_frame(ours, time.monotonic() + 5)
+
+    def test_frame_larger_than_the_protocol_allows_is_refused_before_reading_it(self):
+        ours, theirs = self.pair()
+        theirs.sendall(struct.pack(">I", self.module.MAX_FRAME + 1))
+        theirs.close()
+        with self.assertRaisesRegex(self.module.SearchConsoleError, "oversized"):
+            self.module.read_frame(ours, time.monotonic() + 5)
+
+    def test_truncated_and_silent_answers_are_refused_rather_than_waited_on(self):
+        ours, theirs = self.pair()
+        theirs.sendall(struct.pack(">I", 64) + b"{")
+        theirs.close()
+        with self.assertRaisesRegex(self.module.SearchConsoleError, "closed the Google response"):
+            self.module.read_frame(ours, time.monotonic() + 5)
+        quiet, _held = self.pair()
+        with self.assertRaisesRegex(self.module.SearchConsoleError, "in time"):
+            self.module.read_frame(quiet, time.monotonic() + 0.05)
+
+    def test_rundesk_refuses_a_pipe_where_the_protocol_requires_a_socket(self):
+        """The stand-in makes Rundesk's own check, which is what the passing cases rely on."""
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        with patch.dict(os.environ, self.environment(), clear=True):
+            completed = subprocess.run(
+                [str(self.command), "_google", "accounts", "--response-fd", str(write_fd)],
+                pass_fds=(write_fd,), capture_output=True, text=True, check=False,
+            )
+        os.close(write_fd)
+        self.assertEqual(1, completed.returncode)
+        self.assertIn("not an open socket", completed.stderr)
+
+    def no_child_is_left(self):
+        """No child of this process survives the call, so nothing was killed without being reaped."""
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(-1, os.WNOHANG)
+
+    def test_a_child_that_never_answers_is_stopped_at_the_deadline(self):
+        self.plan["mode"] = "hang"
+        started = time.monotonic()
+        with patch.object(self.module, "BRIDGE_SECONDS", 0.3):
+            code, _, err = self.invoke(["sites"])
+        self.assertEqual(2, code)
+        self.assertIn("in time", err)
+        # The stand-in would sleep for ten minutes, so this bounds the wait rather than the machine.
+        self.assertLess(time.monotonic() - started, 30)
+        self.no_child_is_left()
+
+    def test_a_child_that_answers_and_then_hangs_is_still_stopped(self):
+        self.plan["mode"] = "frame-then-hang"
+        with patch.object(self.module, "BRIDGE_SECONDS", 0.3):
+            code, _, err = self.invoke(["sites"])
+        self.assertEqual(2, code)
+        self.assertIn("in time", err)
+        self.no_child_is_left()
+
+    def test_a_sign_in_nobody_completes_is_stopped_at_its_own_deadline(self):
+        self.plan["mode"] = "login-hang"
+        with patch.object(self.module, "SIGN_IN_SECONDS", 0.3):
+            code, _, err = self.invoke(["sites", "--auth"])
+        self.assertEqual(2, code)
+        self.assertIn("signing in to Google", err)
+        self.assertEqual([], self.requests)
+        self.no_child_is_left()
+
+    def test_rundesk_answering_nothing_at_all_is_a_refusal_with_the_login_command(self):
+        self.plan["mode"] = "silent"
+        code, _, err = self.invoke(["sites"])
+        self.assertEqual(2, code)
+        self.assertIn("rundesk login google", err)
+
+    # --- selecting an app profile and an account -----------------------------------------------
+
+    def test_profile_and_email_are_forwarded_to_rundesk_unchanged(self):
+        self.plan["accounts"] = {"ACME": ["one@example.test", "two@example.test"]}
+        self.payloads = [self.sites_payload()]
+        code, _, err = self.invoke(["sites", "--profile", "acme", "--email", "two@example.test"])
+        self.assertEqual(0, code, err)
+        self.assertEqual(
+            ["_google", "access", "search-console", "--profile", "acme",
+             "--email", "two@example.test"],
+            self.asked()[0][:7],
+        )
+        self.assertEqual(["Bearer access-token-for-two@example.test"], self.authorization())
+
+    def test_several_accounts_under_one_app_profile_need_an_explicit_email(self):
+        self.plan["accounts"] = {"ACME": ["one@example.test", "two@example.test"]}
+        code, _, err = self.invoke(["sites", "--profile", "acme"])
+        self.assertEqual(2, code)
+        self.assertIn("choose --email from: one@example.test, two@example.test", err)
+        self.assertIn("rundesk login google --profile acme", err)
+
+    def test_profiles_lists_every_signed_in_account_without_a_network_call(self):
+        self.plan["accounts"] = {"DEFAULT": ["one@example.test", "two@example.test"]}
+        code, out, err = self.invoke(["profiles"])
+        self.assertEqual(0, code, err)
+        self.assertIn("default,one@example.test,ready", out)
+        self.assertIn("default,two@example.test,ready", out)
+        self.assertEqual(["_google", "accounts", "--response-fd"], self.asked()[0][:3])
+        self.assertEqual([], self.requests)
+
+    def test_profiles_says_what_to_run_when_no_account_is_connected(self):
+        self.plan["accounts"] = {"DEFAULT": []}
+        code, out, _ = self.invoke(["profiles"])
+        self.assertEqual(0, code)
+        self.assertIn("run: rundesk login google", out)
+
+    def test_profiles_reports_an_unconfigured_app_profile_instead_of_failing(self):
+        code, out, _ = self.invoke(["profiles", "--profile", "missing"])
+        self.assertEqual(0, code)
+        self.assertIn("GOOGLE_OAUTH_CLIENT_ID", out)
+
+    # --- recovery and the auth shortcut --------------------------------------------------------
+
+    def test_a_missing_scope_names_the_exact_login_command_for_that_app_profile(self):
+        self.plan["mode"] = "scope"
+        self.plan["accounts"] = {"ACME": ["one@example.test"]}
+        code, _, err = self.invoke(["sites", "--profile", "acme"])
+        self.assertEqual(2, code)
+        self.assertIn("did not return a reusable grant for every requested scope", err)
+        self.assertIn("Run: rundesk login google --profile acme", err)
+
+    def test_auth_signs_in_first_and_forwards_the_app_profile(self):
+        self.plan["accounts"] = {"ACME": ["one@example.test"]}
+        self.payloads = [self.sites_payload()]
+        code, _, err = self.invoke(["sites", "--auth", "--profile", "acme"])
+        self.assertEqual(0, code, err)
+        asked = self.asked()
+        self.assertEqual(["login", "google", "--profile", "acme"], asked[0])
+        self.assertEqual("access", asked[1][1])
+
+    def test_auth_without_a_profile_asks_rundesk_for_its_own_default(self):
+        code, out, err = self.invoke(["profiles", "--auth"])
+        self.assertEqual(0, code, err)
+        self.assertEqual(["login", "google"], self.asked()[0])
+
+    def test_a_declined_sign_in_stops_before_google_is_touched(self):
+        self.plan["mode"] = "login-refused"
+        code, _, err = self.invoke(["sites", "--auth"])
+        self.assertEqual(2, code)
+        self.assertIn("Google login was declined", err)
+        self.assertEqual([], self.requests)
+
+    def test_an_expired_token_is_refused_rather_than_sent_to_google(self):
+        self.plan["mode"] = "expired"
+        code, _, err = self.invoke(["sites"])
+        self.assertEqual(2, code)
+        self.assertIn("expired", err)
+        self.assertEqual([], self.requests)
+
+    # --- an older Rundesk ----------------------------------------------------------------------
+
+    def test_a_rundesk_without_the_bridge_says_to_update_and_sign_in(self):
+        self.plan["mode"] = "old"
+        code, _, err = self.invoke(["sites"])
+        self.assertEqual(2, code)
+        self.assertIn("older than Rundesk-managed Google sign-in", err)
+        self.assertIn("rundesk login google", err)
+
+    def test_no_rundesk_at_all_is_reported_as_the_missing_install_it_is(self):
+        # An empty PATH as well, so the case cannot reach whatever install runs it.
+        code, _, err = self.invoke(["sites"], RUNDESK_COMMAND="", PATH=str(self.home / "none"))
+        self.assertEqual(2, code)
+        self.assertIn("no Rundesk is reachable", err)
+        self.assertIn("rundesk login google", err)
+
+    # --- the token never leaves this process ---------------------------------------------------
+
+    def test_the_token_reaches_no_argument_variable_or_stream(self):
+        self.payloads = [self.sites_payload()]
+        with patch.dict(os.environ, self.environment(), clear=True), patch.object(
+            self.module, "open_url", self.opener
+        ), redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+            code = self.module.main(["sites"])
+            leaked = [name for name, value in os.environ.items() if MANAGED_TOKEN in value]
+        self.assertEqual(0, code, err.getvalue())
+        self.assertEqual([], leaked)
+        self.assertNotIn(MANAGED_TOKEN, out.getvalue())
+        self.assertNotIn(MANAGED_TOKEN, err.getvalue())
+        self.assertNotIn(MANAGED_TOKEN, self.record.read_text(encoding="utf-8"))
+        self.assertNotIn(MANAGED_TOKEN, str(self.module.Access("", "")))
 
 
 if __name__ == "__main__":
