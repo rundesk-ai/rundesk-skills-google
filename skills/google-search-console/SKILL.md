@@ -5,28 +5,39 @@ description: Use when the user needs Google Search Console property discovery, o
 
 # Google Search Console
 
-Run `$RUNDESK_SKILLS/google-search-console/scripts/google-search-console`; it resolves credentials
-itself, so never inspect or print their source. Read `references/cli.md` only for setup, environment
-keys, complete output fields, API behavior, or validation.
+Run `$RUNDESK_SKILLS/google-search-console/scripts/google-search-console`. Rundesk owns Google
+sign-in and hands the command one short-lived token, so never ask for or print a credential. Read
+`references/cli.md` for signing in, complete output fields, API behavior, or validation.
 
-Start with profiles and properties. Never guess a profile or property when more than one is
-available:
+Start with `profiles`, which shows the accounts Rundesk holds and needs no network. Never guess an
+account or a property when more than one is available:
 
 ```sh
 "$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" profiles
-"$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" sites --profile <profile> --limit 25
+"$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" sites --email <address> --limit 25
 ```
+
+`--email` names one signed-in Google account, and is needed only when Rundesk holds more than one;
+the refusal lists the connected addresses. When nothing is connected, the command says so and names
+the command to run. Ask the owner to run `rundesk login google` in their own terminal, or pass
+`--auth` to run that sign-in from here when a browser is available. The `google-auth` skill in this
+catalog owns sign-in, the list of connected accounts, and the Google Cloud setup.
+
+`--profile <app-profile>` exists and is almost never right: it selects a second OAuth **app**, for
+an installation with two Google Cloud projects. Do not add it to a command you construct, and never
+use it to choose an account — that is always `--email`. Never ask anyone for a client ID, a client
+secret, or a refresh token.
 
 Keep performance reads narrow. Default to the last 28 complete days in Google's Pacific reporting
 zone and a small row limit; add only the dimensions needed for the question:
 
 ```sh
 "$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" performance \
-  --profile <profile> --site <property> --dimension query --limit 25
+  --site <property> --dimension query --limit 25
 "$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" inspect-url \
-  --profile <profile> --site <property> --url https://www.example.test/page
+  --site <property> --url https://www.example.test/page
 "$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" sitemaps \
-  --profile <profile> --site <property> --limit 25
+  --site <property> --limit 25
 ```
 
 A URL-prefix property includes its trailing slash; a domain property starts with `sc-domain:`.
@@ -37,7 +48,7 @@ filter given, and a filter works on a dimension the report does not group by:
 
 ```sh
 "$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" performance \
-  --profile <profile> --site <property> --dimension page \
+  --site <property> --dimension page \
   --filter country:equals:usa --filter device:equals:MOBILE --filter query:contains:pricing
 ```
 
@@ -54,16 +65,15 @@ it prints the exact request it would send and refuses until `--confirm` is passe
 
 ```sh
 "$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" submit-sitemap \
-  --profile <profile> --site <property> --sitemap https://www.example.test/sitemap.xml
+  --site <property> --sitemap https://www.example.test/sitemap.xml
 "$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" submit-sitemap \
-  --profile <profile> --site <property> --sitemap https://www.example.test/sitemap.xml --confirm
+  --site <property> --sitemap https://www.example.test/sitemap.xml --confirm
 ```
 
-Submission requires the `https://www.googleapis.com/auth/webmasters` scope. A profile authorized
-only for `webmasters.readonly` is refused by Google, and Google cannot widen a grant that already
-exists, so the owner must reauthorize and store a new refresh token. Get the owner's decision before
-passing `--confirm`, and report the sitemap state the command read back rather than the exit status
-alone.
+Submission requires the `https://www.googleapis.com/auth/webmasters` scope, which Rundesk attaches
+to this package's tokens and widens in the browser when a grant is short. Get the owner's decision
+before passing `--confirm`, and report the sitemap state the command read back rather than the exit
+status alone.
 
 The package still cannot add properties, delete sitemaps, request indexing, or change any other
 Search Console configuration.

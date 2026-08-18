@@ -9,17 +9,19 @@ field, report dimension, metric, or command option.
 
 ### Profile
 
-A named set of credentials for one Google identity. A profile is not a Google Account, Analytics
-account, Search Console property, or Cloud project. Commands report the selected profile alongside
-the resource being queried.
+One OAuth app configuration that Rundesk signs in with. A profile is not a person, a Google Account,
+an Analytics account, a Search Console property, or a Cloud project, and one profile can hold
+several signed-in accounts. Commands report the selected profile alongside the resource queried.
 
-Use `profile` in commands, documentation, and output. Avoid `connection`, `login`, and `account`
-when the value specifically identifies Rundesk credential configuration.
+Use `profile` for the app configuration and `account` for the signed-in Google identity chosen with
+`--email`. Avoid `connection` and `login` for either. An API-key package has no profile of this kind;
+`google-pagespeed-insights` names its own configuration instead.
 
 ### Google identity
 
-The user or service account represented by a profile. Access is determined by both the OAuth scope
-and the permissions granted to this identity on the requested Google resource.
+The signed-in Google account a token belongs to, keyed by Google's immutable subject identifier and
+selected by email. Access is determined by both the OAuth scope Rundesk attached and the permissions
+that account holds on the requested Google resource.
 
 ## Search Console
 
