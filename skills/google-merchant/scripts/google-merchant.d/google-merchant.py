@@ -1,0 +1,1311 @@
+#!/usr/bin/env python3
+"""Read bounded Google Merchant Center account, product, issue, and performance data."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+# Merchant API is versioned per sub-API, so each host path carries its own version segment.
+API_HOST = "https://merchantapi.googleapis.com"
+# v1 is the stable version of every sub-API this package reads. v1beta was discontinued on
+# 28 February 2026 but its endpoints still answer, so the version segment is pinned here as
+# a literal and is never derived from a discovery probe.
+ACCOUNTS_BASE = f"{API_HOST}/accounts/v1"
+PRODUCTS_BASE = f"{API_HOST}/products/v1"
+REPORTS_BASE = f"{API_HOST}/reports/v1"
+ISSUES_BASE = f"{API_HOST}/issueresolution/v1"
+API_BASES = (ACCOUNTS_BASE, PRODUCTS_BASE, REPORTS_BASE, ISSUES_BASE)
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+ACCOUNT_SUFFIX_RE = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)*")
+MAX_PAGES = 100
+
+REQUIRED_FIELDS = (
+    "GOOGLE_MERCHANT_CLIENT_ID",
+    "GOOGLE_MERCHANT_CLIENT_SECRET",
+    "GOOGLE_MERCHANT_REFRESH_TOKEN",
+)
+LEGACY_FIELDS = {
+    "GOOGLE_MERCHANT_CLIENT_ID": "CLIENT_ID",
+    "GOOGLE_MERCHANT_CLIENT_SECRET": "CLIENT_SECRET",
+    "GOOGLE_MERCHANT_REFRESH_TOKEN": "REFRESH_TOKEN",
+    "GOOGLE_MERCHANT_LABEL": "LABEL",
+}
+
+
+class MerchantError(RuntimeError):
+    """A safe, user-facing Merchant Center integration failure."""
+
+
+@dataclass(frozen=True)
+class Profile:
+    name: str
+    client_id: str = field(repr=False)
+    client_secret: str = field(repr=False)
+    refresh_token: str = field(repr=False)
+    label: str
+
+
+def profile_suffix(name: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")
+
+
+def profile_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+def split_csv(value: str) -> List[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def load_dotenv(path: Path, *, required: bool = False) -> None:
+    if not path.exists():
+        if required:
+            raise MerchantError(f"Environment file does not exist: {path}")
+        return
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise MerchantError(f"Cannot read environment file {path}: {exc.strerror or exc}") from exc
+    if mode & 0o077:
+        print(f"WARNING: {path} is readable beyond its owner; run `chmod 600 {path}`.", file=sys.stderr)
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            os.environ.setdefault(key, value)
+
+
+def default_env_paths(explicit: Optional[str]) -> List[Path]:
+    paths: List[Path] = []
+    if explicit:
+        paths.append(Path(explicit).expanduser())
+    for name in ("GOOGLE_MERCHANT_ENV_FILE", "RUNDESK_INTEGRATIONS_ENV"):
+        if os.environ.get(name):
+            paths.append(Path(os.environ[name]).expanduser())
+    config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    paths.extend(
+        [
+            config / "rundesk" / "integrations" / "google-merchant" / "env",
+            config / "google-merchant" / "env",
+        ]
+    )
+    return paths
+
+
+def load_environment(explicit: Optional[str]) -> None:
+    if explicit:
+        load_dotenv(Path(explicit).expanduser(), required=True)
+        return
+    for path in default_env_paths(explicit):
+        if path.exists():
+            load_dotenv(path)
+            break
+
+
+def is_default_profile(name: str) -> bool:
+    return name in ("", "default")
+
+
+def profile_form(name: str) -> str:
+    if is_default_profile(name):
+        return "plain"
+    suffix = profile_suffix(name)
+    has_suffix = any(os.environ.get(f"{field}__{suffix}") for field in REQUIRED_FIELDS)
+    has_legacy = any(
+        os.environ.get(f"GOOGLE_MERCHANT_{suffix}_{LEGACY_FIELDS[field]}")
+        for field in REQUIRED_FIELDS
+    )
+    if has_suffix and has_legacy:
+        raise MerchantError(
+            f"Profile {name!r} is configured in both Rundesk suffix and legacy infix forms; remove one form."
+        )
+    if has_suffix:
+        return "suffix"
+    if has_legacy:
+        return "legacy"
+    return "none"
+
+
+def profile_value(name: str, field: str) -> str:
+    suffix = profile_suffix(name)
+    if field not in REQUIRED_FIELDS:
+        if suffix:
+            for key in (
+                f"{field}__{suffix}",
+                f"GOOGLE_MERCHANT_{suffix}_{LEGACY_FIELDS[field]}",
+            ):
+                if os.environ.get(key):
+                    return os.environ[key]
+        return os.environ.get(field, "") if is_default_profile(name) else ""
+    if is_default_profile(name):
+        return os.environ.get(field, "")
+    form = profile_form(name)
+    if form == "suffix":
+        return os.environ.get(f"{field}__{suffix}", "")
+    if form == "legacy":
+        return os.environ.get(f"GOOGLE_MERCHANT_{suffix}_{LEGACY_FIELDS[field]}", "")
+    return ""
+
+
+def missing_name(name: str, field: str) -> str:
+    if is_default_profile(name):
+        return field
+    suffix = profile_suffix(name)
+    if profile_form(name) == "legacy":
+        return f"GOOGLE_MERCHANT_{suffix}_{LEGACY_FIELDS[field]}"
+    return f"{field}__{suffix}"
+
+
+def configured_profile_names() -> List[str]:
+    explicit = split_csv(os.environ.get("GOOGLE_MERCHANT_PROFILES", ""))
+    if explicit:
+        return sorted(set(explicit))
+    suffixed = set()
+    infixed = set()
+    legacy_pattern = re.compile(
+        r"^GOOGLE_MERCHANT_(.+)_(CLIENT_ID|CLIENT_SECRET|REFRESH_TOKEN|LABEL)$"
+    )
+    for key in os.environ:
+        for field in REQUIRED_FIELDS:
+            prefix = field + "__"
+            candidate = key[len(prefix):] if key.startswith(prefix) else ""
+            if candidate and ACCOUNT_SUFFIX_RE.fullmatch(candidate):
+                suffixed.add(profile_label(candidate))
+        match = legacy_pattern.match(key)
+        if match:
+            if match.group(1) == "DEFAULT":
+                infixed.add("default")
+            elif match.group(1) not in {"CLIENT", "REFRESH"}:
+                infixed.add(profile_label(match.group(1)))
+    names = suffixed | infixed
+    if not infixed and any(os.environ.get(field) for field in REQUIRED_FIELDS):
+        names.add(os.environ.get("GOOGLE_MERCHANT_DEFAULT_PROFILE") or "default")
+    return sorted(names)
+
+
+def get_profile(name: str) -> Profile:
+    values = {field: profile_value(name, field) for field in REQUIRED_FIELDS}
+    missing = [missing_name(name, field) for field, value in values.items() if not value]
+    if missing:
+        raise MerchantError(
+            "Missing Google Merchant config: "
+            + ", ".join(missing)
+            + ". Run `rundesk skills configure`, add it to the secrets dotenv, or export it in the shell."
+        )
+    return Profile(
+        name=name,
+        client_id=values["GOOGLE_MERCHANT_CLIENT_ID"],
+        client_secret=values["GOOGLE_MERCHANT_CLIENT_SECRET"],
+        refresh_token=values["GOOGLE_MERCHANT_REFRESH_TOKEN"],
+        label=profile_value(name, "GOOGLE_MERCHANT_LABEL") or name,
+    )
+
+
+def selected_profile_name(args: argparse.Namespace) -> str:
+    if getattr(args, "profile", None):
+        return args.profile
+    names = configured_profile_names()
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        raise MerchantError("No Google Merchant profiles are configured. Run `rundesk skills configure`.")
+    raise MerchantError("Multiple Google Merchant profiles are configured; pass --profile explicitly.")
+
+
+class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so credentials never cross an unexpected request boundary."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def open_url(request: urllib.request.Request, timeout: int = 30):
+    return urllib.request.build_opener(RejectRedirectHandler()).open(request, timeout=timeout)
+
+
+def expect_object(value: Any, noun: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise MerchantError(f"Google Merchant returned a malformed {noun}.")
+    return value
+
+
+def expect_objects(container: Dict[str, Any], key: str, noun: str) -> List[Dict[str, Any]]:
+    items = container.get(key, [])
+    if not isinstance(items, list):
+        raise MerchantError(f"Google Merchant returned a malformed {noun} collection.")
+    return [expect_object(item, noun) for item in items]
+
+
+def decode_response(response: Any, noun: str = "API response") -> Dict[str, Any]:
+    raw = response.read()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MerchantError(f"Google Merchant returned a malformed {noun}: the body is not valid JSON.") from exc
+    # A list or scalar body would otherwise surface as an attribute error several frames later.
+    return expect_object(payload, noun)
+
+
+def safe_error(exc: urllib.error.HTTPError) -> str:
+    try:
+        body = json.loads(exc.read().decode("utf-8"))
+        message = body.get("error", {}).get("message") or body.get("error_description")
+        if message:
+            return str(message)
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        pass
+    return f"HTTP {exc.code}"
+
+
+def refresh_access_token(profile: Profile) -> str:
+    form = urllib.parse.urlencode(
+        {
+            "client_id": profile.client_id,
+            "client_secret": profile.client_secret,
+            "refresh_token": profile.refresh_token,
+            "grant_type": "refresh_token",
+        }
+    ).encode("ascii")
+    request = urllib.request.Request(
+        TOKEN_URL,
+        data=form,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        payload = decode_response(open_url(request), "OAuth token response")
+    except urllib.error.HTTPError as exc:
+        raise MerchantError(f"Google OAuth token refresh failed: {safe_error(exc)}.") from exc
+    except urllib.error.URLError as exc:
+        raise MerchantError(f"Google OAuth token refresh failed: {exc.reason}.") from exc
+    token = payload.get("access_token")
+    if not isinstance(token, str) or not token:
+        raise MerchantError("Google OAuth token refresh returned no access token.")
+    return token
+
+
+def api_request(
+    access_token: str,
+    method: str,
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    payload: Optional[Dict[str, Any]] = None,
+    retries: int = 2,
+) -> Dict[str, Any]:
+    if not any(url.startswith(base + "/") for base in API_BASES):
+        raise MerchantError("Refused an unexpected Google Merchant API origin.")
+    if params:
+        encoded = urllib.parse.urlencode(params, doseq=True)
+        url += ("&" if "?" in url else "?") + encoded
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    for attempt in range(retries + 1):
+        try:
+            return decode_response(open_url(request))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 500, 502, 503, 504) and attempt < retries:
+                delay = min(8, 2**attempt)
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                if retry_after and retry_after.isdigit():
+                    delay = min(30, int(retry_after))
+                exc.read()
+                time.sleep(delay)
+                continue
+            raise MerchantError(f"Google Merchant API request failed: {safe_error(exc)}.") from exc
+        except urllib.error.URLError as exc:
+            raise MerchantError(f"Google Merchant API request failed: {exc.reason}.") from exc
+    raise MerchantError("Google Merchant API request failed.")
+
+
+def emit_csv(headers: Sequence[str], rows: Iterable[Sequence[Any]]) -> None:
+    writer = csv.writer(sys.stdout, lineterminator="\n")
+    writer.writerow(headers)
+    writer.writerows(rows)
+
+
+def emit_json(value: Any) -> None:
+    json.dump(value, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def warn_truncated(truncated: bool, limit: int) -> None:
+    if truncated:
+        print(f"WARNING: Results were truncated at --limit {limit}.", file=sys.stderr)
+
+
+def bounded_limit(value: int, maximum: int = 5000) -> int:
+    if value < 1 or value > maximum:
+        raise MerchantError(f"--limit must be between 1 and {maximum}.")
+    return value
+
+
+# --- Merchant Center Query Language ------------------------------------------------
+#
+# MCQL's published grammar is:
+#     Query       -> SelectClause FromClause? WhereClause? OrderByClause? LimitClause?
+#     WhereClause -> WHERE Condition (AND Condition)*
+#     Condition   -> FieldName Operator Value | FieldName BETWEEN Value AND Value
+#     String      -> (' Char* ') | (" Char* ")
+# Three properties of that grammar drive this whole module.
+#
+# First, the string production defines no escape sequence at all: there is no documented
+# way to represent a quote inside an MCQL literal. So this package never escapes a
+# literal, it refuses one that would need escaping. A rejected search term is a visible
+# failure; a silently mangled or injected WHERE clause is not.
+#
+# Second, WHERE takes AND only. Google states the clause "doesn't support OR", and the
+# grammar has no parentheses, so a caller cannot smuggle disjunction past this builder.
+#
+# Third, there is no GROUP BY. Segmentation is implicit: selecting a segment field
+# groups by it. Every command here therefore controls grouping by choosing which
+# segment columns it selects, not by emitting a clause.
+#
+# Field names are snake_case in a request and camelCase in the response, so each view
+# below carries both forms.
+
+MCQL_NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Google's Function production, which is the complete set of relative ranges DURING accepts.
+DURING_RANGES = (
+    "LAST_7_DAYS", "LAST_14_DAYS", "LAST_30_DAYS", "LAST_BUSINESS_WEEK", "LAST_MONTH",
+    "LAST_WEEK_MON_SUN", "LAST_WEEK_SUN_SAT", "THIS_MONTH", "THIS_WEEK_MON_TODAY",
+    "THIS_WEEK_SUN_TODAY", "TODAY", "YESTERDAY",
+)
+# The characters that would end or extend a literal, plus the backslash a caller might
+# expect to neutralize them with. MCQL documents no escape, so each one is refused.
+UNQUOTABLE = "'\"\\"
+
+
+def mcql_name(value: str, kind: str = "field") -> str:
+    """Accept only a bare snake_case MCQL identifier."""
+    if not isinstance(value, str) or not MCQL_NAME_RE.fullmatch(value):
+        raise MerchantError(f"Invalid Merchant {kind} name: {value!r}.")
+    return value
+
+
+def mcql_string(value: str) -> str:
+    """Quote a literal, refusing any value MCQL cannot represent."""
+    if not isinstance(value, str) or not value:
+        raise MerchantError("A Merchant filter value must be a non-empty string.")
+    for char in value:
+        if char in UNQUOTABLE:
+            raise MerchantError(
+                f"Merchant filter values cannot contain {char!r}: the query language defines no escape for it."
+            )
+        # A control character cannot appear in a Char* literal and would split the query.
+        if ord(char) < 0x20 or ord(char) == 0x7F:
+            raise MerchantError("Merchant filter values cannot contain control characters.")
+    return f"'{value}'"
+
+
+def mcql_date(value: str, option: str) -> str:
+    """Accept only a real ISO 8601 calendar day, which is the date form MCQL documents."""
+    if not DATE_RE.fullmatch(value or ""):
+        raise MerchantError(f"{option} must be an ISO 8601 date such as 2024-01-31, got {value!r}.")
+    year, month, day = (int(part) for part in value.split("-"))
+    try:
+        date(year, month, day)
+    except ValueError as exc:
+        raise MerchantError(f"{option} is not a real calendar date: {value!r}.") from exc
+    return f"'{value}'"
+
+
+@dataclass(frozen=True)
+class Query:
+    """One bounded MCQL query, assembled only from package-defined names and checked values."""
+
+    table: str
+    select: Tuple[str, ...]
+    where: Tuple[str, ...] = ()
+    order_by: str = ""
+    descending: bool = True
+    limit: int = 0
+
+    def text(self) -> str:
+        if not self.select:
+            raise MerchantError("A Merchant query must select at least one field.")
+        parts = [
+            "SELECT " + ", ".join(mcql_name(name) for name in self.select),
+            "FROM " + mcql_name(self.table, "table"),
+        ]
+        if self.where:
+            # AND only: the grammar offers no OR and no parentheses.
+            parts.append("WHERE " + " AND ".join(self.where))
+        if self.order_by:
+            parts.append(
+                "ORDER BY " + mcql_name(self.order_by) + (" DESC" if self.descending else " ASC")
+            )
+        if self.limit:
+            # Report commands request one sentinel row beyond their public 5,000-row
+            # ceiling so an exact page can still prove whether output was truncated.
+            parts.append(f"LIMIT {bounded_limit(self.limit, 5001)}")
+        return " ".join(parts)
+
+
+def equals(name: str, value: str) -> str:
+    return f"{mcql_name(name)} = {mcql_string(value)}"
+
+
+def within(name: str, values: Sequence[str]) -> str:
+    if not values:
+        raise MerchantError(f"An {name} filter needs at least one value.")
+    return f"{mcql_name(name)} IN ({', '.join(mcql_string(value) for value in values)})"
+
+
+def between_dates(name: str, start: str, end: str) -> str:
+    return (
+        f"{mcql_name(name)} BETWEEN {mcql_date(start, '--start-date')} "
+        f"AND {mcql_date(end, '--end-date')}"
+    )
+
+
+def during(name: str, window: str) -> str:
+    if window not in DURING_RANGES:
+        raise MerchantError(f"Unknown relative range {window!r}.")
+    return f"{mcql_name(name)} DURING {window}"
+
+
+# --- Reports transport --------------------------------------------------------------
+
+# reports.search caps a page at 1000 rows; asking for more is an argument error, not a
+# larger page, so the request is clamped instead of forwarded.
+MAX_PAGE_SIZE = 1000
+
+
+def account_id(value: str) -> str:
+    """Accept a bare Merchant Center account ID or its `accounts/{id}` resource name."""
+    if not isinstance(value, str):
+        raise MerchantError(f"Expected a numeric Merchant account ID, got {value!r}.")
+    cleaned = value.strip()
+    if cleaned.startswith("accounts/"):
+        cleaned = cleaned.split("/", 1)[1]
+    if not cleaned.isdigit():
+        raise MerchantError(f"Expected a numeric Merchant account ID, got {value!r}.")
+    return cleaned
+
+
+def search_rows(token: str, account: str, query: Query, limit: int, view: str) -> Tuple[List[Dict[str, Any]], bool]:
+    """Page through reports.search and return at most `limit` rows of one view."""
+    url = f"{REPORTS_BASE}/accounts/{account}/reports:search"
+    text = query.text()
+    rows: List[Dict[str, Any]] = []
+    page_token = ""
+    seen_tokens = set()
+    for _ in range(MAX_PAGES):
+        payload: Dict[str, Any] = {
+            "query": text,
+            "pageSize": max(1, min(MAX_PAGE_SIZE, limit - len(rows))),
+        }
+        if page_token:
+            payload["pageToken"] = page_token
+        response = api_request(token, "POST", url, payload=payload)
+        results = expect_objects(response, "results", "report row")
+        remaining = limit - len(rows)
+        truncated_here = len(results) > remaining
+        for result in results[:remaining]:
+            # Each row nests its columns under the camelCase name of the queried view.
+            if view not in result:
+                raise MerchantError(f"Google Merchant returned a report row without {view}.")
+            rows.append(expect_object(result[view], "report row"))
+        next_token = response.get("nextPageToken", "")
+        if not isinstance(next_token, str):
+            raise MerchantError("Google Merchant returned a malformed page token.")
+        if len(rows) >= limit:
+            return rows, truncated_here or bool(next_token)
+        if not next_token:
+            return rows, False
+        if not results:
+            # A token that returns nothing would otherwise loop until MAX_PAGES.
+            return rows, True
+        if next_token in seen_tokens:
+            raise MerchantError("Google Merchant pagination did not advance.")
+        seen_tokens.add(next_token)
+        page_token = next_token
+    raise MerchantError(f"Google Merchant pagination exceeded {MAX_PAGES} pages.")
+
+
+# --- List transport -----------------------------------------------------------------
+#
+# Every Merchant list method omits nextPageToken on the last page rather than sending an
+# empty one, and each documents its own page-size ceiling above which Google silently
+# coerces the value. Each caller passes its own ceiling so a request never asks for a
+# page the method does not offer.
+
+
+def list_rows(
+    token: str,
+    url: str,
+    key: str,
+    noun: str,
+    limit: int,
+    page_ceiling: int,
+    params: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    rows: List[Dict[str, Any]] = []
+    page_token = ""
+    seen_tokens = set()
+    for _ in range(MAX_PAGES):
+        query: Dict[str, Any] = dict(params or {})
+        query["pageSize"] = max(1, min(page_ceiling, limit - len(rows)))
+        if page_token:
+            query["pageToken"] = page_token
+        response = api_request(token, "GET", url, params=query)
+        page = expect_objects(response, key, noun)
+        remaining = limit - len(rows)
+        truncated_here = len(page) > remaining
+        rows.extend(page[:remaining])
+        next_token = response.get("nextPageToken", "")
+        if not isinstance(next_token, str):
+            raise MerchantError("Google Merchant returned a malformed page token.")
+        if len(rows) >= limit:
+            return rows, truncated_here or bool(next_token)
+        # A short page does not mean the end; only a missing token does.
+        if not next_token:
+            return rows, False
+        if not page:
+            return rows, True
+        if next_token in seen_tokens:
+            raise MerchantError("Google Merchant pagination did not advance.")
+        seen_tokens.add(next_token)
+        page_token = next_token
+    raise MerchantError(f"Google Merchant pagination exceeded {MAX_PAGES} pages.")
+
+
+def text_field(row: Dict[str, Any], name: str) -> str:
+    """Read one scalar cell, keeping an unexpected nested value out of the output."""
+    value = row.get(name, "")
+    if isinstance(value, (dict, list)):
+        raise MerchantError(f"Google Merchant returned a malformed {name} value.")
+    if value is None or value is False:
+        return "" if value is None else "false"
+    if value is True:
+        return "true"
+    return str(value)
+
+
+def emit_rows(headers: Sequence[str], rows: List[Dict[str, Any]], as_json: bool) -> None:
+    if as_json:
+        emit_json(rows)
+        return
+    emit_csv(headers, ([row.get(header, "") for header in headers] for row in rows))
+
+
+# --- Accounts, status, and item issues ----------------------------------------------
+
+# Google's reporting-context enum. Unknown members returned by Google are passed through
+# unchanged; this tuple only bounds what a caller may send in a filter.
+REPORTING_CONTEXTS = (
+    "SHOPPING_ADS", "DEMAND_GEN_ADS", "DEMAND_GEN_ADS_DISCOVER_SURFACE", "VIDEO_ADS",
+    "DISPLAY_ADS", "LOCAL_INVENTORY_ADS", "VEHICLE_INVENTORY_ADS", "FREE_LISTINGS",
+    "FREE_LISTINGS_UCP_CHECKOUT", "FREE_LOCAL_LISTINGS", "FREE_LOCAL_VEHICLE_LISTINGS",
+    "YOUTUBE_AFFILIATE", "YOUTUBE_SHOPPING", "YOUTUBE_CHECKOUT", "CLOUD_RETAIL",
+    "LOCAL_CLOUD_RETAIL", "PRODUCT_REVIEWS", "MERCHANT_REVIEWS",
+)
+COUNTRY_RE = re.compile(r"[A-Z]{2}")
+ACCOUNT_PAGE_CEILING = 500
+ISSUE_PAGE_CEILING = 100
+STATUS_PAGE_CEILING = 250
+
+
+def country_code(value: str) -> str:
+    """Accept only a CLDR/ISO 3166-1 alpha-2 territory code."""
+    cleaned = (value or "").strip().upper()
+    if not COUNTRY_RE.fullmatch(cleaned):
+        raise MerchantError(f"--country must be a two-letter country code such as US, got {value!r}.")
+    return cleaned
+
+
+def reporting_context(value: str) -> str:
+    cleaned = (value or "").strip().upper()
+    if cleaned not in REPORTING_CONTEXTS:
+        raise MerchantError(
+            f"--reporting-context must be one of: {', '.join(REPORTING_CONTEXTS)}."
+        )
+    return cleaned
+
+
+def status_filter(context: str, country: str) -> str:
+    """Build the aggregate-status filter, which accepts only reportingContext and country."""
+    terms = []
+    if context:
+        terms.append(f'reportingContext = "{reporting_context(context)}"')
+    if country:
+        terms.append(f'country = "{country_code(country)}"')
+    return " AND ".join(terms)
+
+
+def expect_known_shape(row: Dict[str, Any], expected: Sequence[str], noun: str) -> Dict[str, Any]:
+    """Refuse a row that carries none of the fields this package knows how to read.
+
+    A shape this package does not recognize is reported rather than rendered as a row
+    of empty columns. A blank column reads as "no issues", which is the one wrong answer
+    that must never be produced silently.
+    """
+    if not any(key in row for key in expected):
+        raise MerchantError(
+            f"Google Merchant returned an unrecognized {noun} shape; expected one of: "
+            + ", ".join(expected)
+            + "."
+        )
+    return row
+
+
+def command_profiles(args: argparse.Namespace) -> None:
+    rows = []
+    for name in configured_profile_names():
+        configured = all(profile_value(name, field) for field in REQUIRED_FIELDS)
+        rows.append(
+            {
+                "profile": name,
+                "label": profile_value(name, "GOOGLE_MERCHANT_LABEL") or name,
+                "configured": str(configured).lower(),
+            }
+        )
+    emit_rows(("profile", "label", "configured"), rows, args.json)
+
+
+def command_accounts(args: argparse.Namespace) -> None:
+    profile = get_profile(selected_profile_name(args))
+    limit = bounded_limit(args.limit, 2000)
+    token = refresh_access_token(profile)
+    accounts, truncated = list_rows(
+        token, f"{ACCOUNTS_BASE}/accounts", "accounts", "account", limit, ACCOUNT_PAGE_CEILING
+    )
+    rows = []
+    for account in accounts:
+        zone = expect_object(account.get("timeZone", {}), "account time zone")
+        rows.append(
+            {
+                "account_id": text_field(account, "accountId"),
+                "account_name": text_field(account, "accountName"),
+                "language_code": text_field(account, "languageCode"),
+                "time_zone": text_field(zone, "id"),
+                "adult_content": text_field(account, "adultContent"),
+                "test_account": text_field(account, "testAccount"),
+                "profile": profile.name,
+            }
+        )
+    emit_rows(
+        ("account_id", "account_name", "language_code", "time_zone", "adult_content",
+         "test_account", "profile"),
+        rows,
+        args.json,
+    )
+    warn_truncated(truncated, limit)
+
+
+def command_status(args: argparse.Namespace) -> None:
+    profile = get_profile(selected_profile_name(args))
+    account = account_id(args.account)
+    limit = bounded_limit(args.limit, 1000)
+    params = {}
+    selector = status_filter(args.reporting_context or "", args.country or "")
+    if selector:
+        params["filter"] = selector
+    statuses, truncated = list_rows(
+        refresh_access_token(profile),
+        f"{ISSUES_BASE}/accounts/{account}/aggregateProductStatuses",
+        "aggregateProductStatuses",
+        "aggregate product status",
+        limit,
+        STATUS_PAGE_CEILING,
+        params=params,
+    )
+    rows = []
+    for status in statuses:
+        if "stats" not in status:
+            raise MerchantError("Google Merchant returned an aggregate product status without stats.")
+        stats = expect_object(status["stats"], "product status stats")
+        rows.append(
+            {
+                "reporting_context": text_field(status, "reportingContext"),
+                "country": text_field(status, "country"),
+                "active": text_field(stats, "activeCount"),
+                "pending": text_field(stats, "pendingCount"),
+                "expiring": text_field(stats, "expiringCount"),
+                "disapproved": text_field(stats, "disapprovedCount"),
+                "issue_count": len(expect_objects(status, "itemLevelIssues", "item level issue")),
+                "account_id": account,
+                "profile": profile.name,
+            }
+        )
+    emit_rows(
+        ("reporting_context", "country", "active", "pending", "expiring", "disapproved",
+         "issue_count", "account_id", "profile"),
+        rows,
+        args.json,
+    )
+    warn_truncated(truncated, limit)
+
+
+def command_issues(args: argparse.Namespace) -> None:
+    profile = get_profile(selected_profile_name(args))
+    account = account_id(args.account)
+    limit = bounded_limit(args.limit, 1000)
+    params = {}
+    selector = status_filter(args.reporting_context or "", args.country or "")
+    if selector:
+        params["filter"] = selector
+    # The command limit applies to emitted issues, not to country/context buckets.
+    # Read a separately bounded set of aggregate buckets before ranking their issues;
+    # otherwise one bucket can produce more rows than the operator requested.
+    statuses, statuses_truncated = list_rows(
+        refresh_access_token(profile),
+        f"{ISSUES_BASE}/accounts/{account}/aggregateProductStatuses",
+        "aggregateProductStatuses",
+        "aggregate product status",
+        1000,
+        STATUS_PAGE_CEILING,
+        params=params,
+    )
+    rows = []
+    for status in statuses:
+        expect_known_shape(status, ("stats", "itemLevelIssues"), "aggregate product status")
+        context = text_field(status, "reportingContext")
+        country = text_field(status, "country")
+        for issue in expect_objects(status, "itemLevelIssues", "item level issue"):
+            rows.append(
+                {
+                    "code": text_field(issue, "code"),
+                    "severity": text_field(issue, "severity"),
+                    "resolution": text_field(issue, "resolution"),
+                    "products": text_field(issue, "productCount"),
+                    "attribute": text_field(issue, "attribute"),
+                    "reporting_context": context,
+                    "country": country,
+                    "description": text_field(issue, "description"),
+                    # The issueresolution sub-API names this documentationUri; the products
+                    # sub-API names the same link documentation. They are not interchangeable.
+                    "documentation": text_field(issue, "documentationUri"),
+                    "account_id": account,
+                    "profile": profile.name,
+                }
+            )
+    # Largest blast radius first, so a small --limit still shows what matters most.
+    def product_count(row: Dict[str, Any]) -> int:
+        try:
+            return int(row["products"])
+        except (TypeError, ValueError) as exc:
+            raise MerchantError("Google Merchant returned a malformed productCount value.") from exc
+
+    rows.sort(key=product_count, reverse=True)
+    truncated = statuses_truncated or len(rows) > limit
+    rows = rows[:limit]
+    emit_rows(
+        ("code", "severity", "resolution", "products", "attribute", "reporting_context",
+         "country", "description", "documentation", "account_id", "profile"),
+        rows,
+        args.json,
+    )
+    warn_truncated(truncated, limit)
+
+
+# --- Report value rendering ---------------------------------------------------------
+
+
+def money_amount(value: Dict[str, Any]) -> str:
+    """Render a Price as its currency's standard unit. Micros are an int64 sent as a string."""
+    raw = value.get("amountMicros", "")
+    if raw in ("", None):
+        return ""
+    try:
+        micros = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise MerchantError("Google Merchant returned a malformed price amount.") from exc
+    # Decimal keeps a price exact; binary floats do not represent cents exactly.
+    return str(Decimal(micros) / Decimal(1000000))
+
+
+def report_cell(value: Any) -> str:
+    """Render one report field, flattening the shapes Google nests inside a row."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return "|".join(report_cell(item) for item in value)
+    if isinstance(value, dict):
+        if "amountMicros" in value or "currencyCode" in value:
+            return money_amount(value)
+        # A google.type.Date arrives as an object here and as a plain string elsewhere.
+        if "year" in value and "month" in value and "day" in value:
+            return "{0:04d}-{1:02d}-{2:02d}".format(
+                int(value.get("year") or 0), int(value.get("month") or 0), int(value.get("day") or 0)
+            )
+        raise MerchantError("Google Merchant returned an unexpected nested report value.")
+    return str(value)
+
+
+def is_money(value: Any) -> bool:
+    """Recognize a Price exactly as report_cell renders one, so the two never disagree."""
+    return isinstance(value, dict) and ("amountMicros" in value or "currencyCode" in value)
+
+
+def report_currency(value: Any) -> str:
+    if is_money(value):
+        code = value.get("currencyCode", "")
+        return str(code) if code else ""
+    return ""
+
+
+def camel(name: str) -> str:
+    """Map an MCQL snake_case field to the camelCase key Google returns it under."""
+    head, _, tail = name.partition("_")
+    return head + "".join(part[:1].upper() + part[1:] for part in tail.split("_") if part)
+
+
+def report_table(rows: List[Dict[str, Any]], fields: Sequence[str], extra: Dict[str, str]) -> Tuple[List[str], List[Dict[str, str]]]:
+    """Flatten report rows into CSV columns, giving any Price field its own currency column."""
+    headers: List[str] = []
+    for name in fields:
+        headers.append(name)
+        if name in MONEY_FIELDS or any(is_money(row.get(camel(name))) for row in rows):
+            headers.append(f"{name}_currency")
+    headers.extend(extra)
+    table = []
+    for row in rows:
+        record: Dict[str, str] = {}
+        for name in fields:
+            value = row.get(camel(name))
+            record[name] = report_cell(value)
+            if f"{name}_currency" in headers:
+                record[f"{name}_currency"] = report_currency(value)
+        record.update(extra)
+        table.append(record)
+    return headers, table
+
+
+# --- Bounded reports ----------------------------------------------------------------
+#
+# Every field name below is a current Merchant API v1 name taken from the reports_v1
+# ReportRow reference. Callers choose a breakdown, never a raw field list, so a query
+# can only ever be assembled from names checked in here.
+
+PERFORMANCE_METRICS = (
+    "clicks", "impressions", "click_through_rate", "conversions", "conversion_value",
+    "conversion_rate",
+)
+MONEY_FIELDS = frozenset({"price", "benchmark_price", "suggested_price", "conversion_value"})
+# Google restricts the conversion metrics to the free traffic source, so an ads-only
+# account sees them empty. That is a measurement boundary, not a failed query.
+FREE_ONLY_METRICS = ("conversions", "conversion_value", "conversion_rate")
+
+PERFORMANCE_BREAKDOWNS = {
+    "date": ("date",),
+    "week": ("week",),
+    "product": ("offer_id", "title"),
+    "brand": ("brand",),
+    "category": ("category_l1", "category_l2", "category_l3"),
+    "product-type": ("product_type_l1", "product_type_l2", "product_type_l3"),
+    "country": ("customer_country_code",),
+    "marketing-method": ("marketing_method",),
+    "store-type": ("store_type",),
+    "custom-label": ("custom_label_0",),
+}
+# A time series reads in order; every other breakdown reads largest first.
+TIME_BREAKDOWNS = frozenset({"date", "week"})
+MARKETING_METHODS = ("ADS", "ORGANIC")
+STORE_TYPES = ("ONLINE_STORE", "LOCAL_STORES")
+
+PRODUCT_FIELDS = (
+    "id", "offer_id", "title", "brand", "condition", "availability", "price",
+    "aggregated_reporting_context_status", "click_potential", "click_potential_rank",
+    "channel", "feed_label", "language_code",
+)
+PRODUCT_STATUSES = (
+    "ELIGIBLE", "ELIGIBLE_LIMITED", "PENDING", "NOT_ELIGIBLE_OR_DISAPPROVED",
+)
+
+PRICE_COMPETITIVENESS_FIELDS = (
+    "id", "offer_id", "title", "brand", "price", "benchmark_price", "report_country_code",
+)
+PRICE_INSIGHTS_FIELDS = (
+    "id", "offer_id", "title", "brand", "price", "suggested_price", "effectiveness",
+    "predicted_impressions_change_fraction", "predicted_clicks_change_fraction",
+    "predicted_conversions_change_fraction",
+)
+
+BEST_SELLER_VIEWS = {
+    "products": (
+        "best_sellers_product_cluster_view",
+        ("report_date", "report_granularity", "report_country_code", "report_category_id",
+         "rank", "previous_rank", "relative_demand", "previous_relative_demand",
+         "relative_demand_change", "title", "brand", "inventory_status"),
+    ),
+    "brands": (
+        "best_sellers_brand_view",
+        ("report_date", "report_granularity", "report_country_code", "report_category_id",
+         "rank", "previous_rank", "relative_demand", "previous_relative_demand",
+         "relative_demand_change", "brand"),
+    ),
+}
+GRANULARITIES = {"weekly": "WEEKLY", "monthly": "MONTHLY"}
+
+# The three competitive-visibility views disagree about `date`: the benchmark view
+# requires it in SELECT, the top-merchant view forbids it there, and all three require
+# it in WHERE. Each view therefore carries its own selected columns.
+VISIBILITY_VIEWS = {
+    "benchmark": (
+        "competitive_visibility_benchmark_view",
+        ("date", "report_country_code", "report_category_id", "traffic_source",
+         "your_domain_visibility_trend", "category_benchmark_visibility_trend"),
+        "",
+    ),
+    "competitor": (
+        "competitive_visibility_competitor_view",
+        ("date", "domain", "is_your_domain", "report_country_code", "report_category_id",
+         "traffic_source", "rank", "ads_organic_ratio", "page_overlap_rate",
+         "higher_position_rate", "relative_visibility"),
+        "rank",
+    ),
+    "top-merchant": (
+        "competitive_visibility_top_merchant_view",
+        ("domain", "is_your_domain", "report_country_code", "report_category_id",
+         "traffic_source", "rank", "ads_organic_ratio", "page_overlap_rate",
+         "higher_position_rate"),
+        "rank",
+    ),
+}
+TRAFFIC_SOURCES = ("ORGANIC", "ADS", "ALL")
+
+
+def category_id(value: str) -> str:
+    """Google's numeric product-category ID, which its own samples send unquoted."""
+    cleaned = (value or "").strip()
+    if not cleaned.isdigit():
+        raise MerchantError(f"--category must be a numeric Google product category ID, got {value!r}.")
+    return cleaned
+
+
+def enum_choice(value: str, allowed: Sequence[str], option: str) -> str:
+    cleaned = (value or "").strip().upper().replace("-", "_")
+    if cleaned not in allowed:
+        raise MerchantError(f"{option} must be one of: {', '.join(allowed).lower()}.")
+    return cleaned
+
+
+def run_report(
+    args: argparse.Namespace,
+    table: str,
+    fields: Sequence[str],
+    where: Sequence[str],
+    order_by: str = "",
+    descending: bool = True,
+    notes: Sequence[str] = (),
+) -> None:
+    profile = get_profile(selected_profile_name(args))
+    account = account_id(args.account)
+    limit = bounded_limit(args.limit)
+    query = Query(table, tuple(fields), tuple(where), order_by, descending, limit + 1)
+    # Assemble and check the query before refreshing a token, so a rejected value costs
+    # no network round trip and no credential use.
+    query.text()
+    rows, transport_truncated = search_rows(
+        refresh_access_token(profile), account, query, limit + 1, camel(table)
+    )
+    truncated = transport_truncated or len(rows) > limit
+    rows = rows[:limit]
+    headers, table_rows = report_table(
+        rows, fields, {"account_id": account, "profile": profile.name}
+    )
+    emit_rows(headers, table_rows, args.json)
+    for note in notes:
+        print(f"NOTE: {note}", file=sys.stderr)
+    warn_truncated(truncated, limit)
+
+
+def date_condition(args: argparse.Namespace) -> str:
+    """Resolve the required date condition from an explicit window or a relative range.
+
+    Defaulting to Google's own DURING constant keeps the query free of this machine's
+    clock, so a report asks Google what "the last 30 days" means in the account's own
+    time zone rather than guessing it here.
+    """
+    if args.start_date or args.end_date:
+        if not (args.start_date and args.end_date):
+            raise MerchantError("--start-date and --end-date must be given together.")
+        return between_dates("date", args.start_date, args.end_date)
+    return during("date", args.during.strip().upper())
+
+
+def command_performance(args: argparse.Namespace) -> None:
+    segments = PERFORMANCE_BREAKDOWNS[args.breakdown]
+    # Google requires a date condition on every performance query and requires at least
+    # one metric beside any segment, so both are structural here rather than optional.
+    where = [date_condition(args)]
+    if args.marketing_method:
+        where.append(
+            equals("marketing_method", enum_choice(args.marketing_method, MARKETING_METHODS, "--marketing-method"))
+        )
+    if args.country:
+        where.append(equals("customer_country_code", country_code(args.country)))
+    if args.store_type:
+        where.append(equals("store_type", enum_choice(args.store_type, STORE_TYPES, "--store-type")))
+    time_series = args.breakdown in TIME_BREAKDOWNS
+    run_report(
+        args,
+        "product_performance_view",
+        tuple(segments) + PERFORMANCE_METRICS,
+        where,
+        order_by=segments[0] if time_series else "clicks",
+        descending=not time_series,
+        notes=(
+            "Dates are days in the Merchant Center account time zone.",
+            "Google reports conversions, conversion value, and conversion rate only for the "
+            "free traffic source, so ads rows leave them empty.",
+            "A row carrying a price metric is returned once per currency, separately from the "
+            "non-price metrics; do not sum the two kinds of row together.",
+        ),
+    )
+
+
+def command_products(args: argparse.Namespace) -> None:
+    where = []
+    if args.status:
+        where.append(
+            equals("aggregated_reporting_context_status", enum_choice(args.status, PRODUCT_STATUSES, "--status"))
+        )
+    if args.brand:
+        where.append(equals("brand", args.brand))
+    if args.reporting_context:
+        # reporting_context is filterable only; Google refuses it in a SELECT clause.
+        where.append(equals("reporting_context", reporting_context(args.reporting_context)))
+    run_report(
+        args,
+        "product_view",
+        PRODUCT_FIELDS,
+        where,
+        order_by="click_potential_rank",
+        descending=False,
+        notes=(
+            "Click potential rank runs from 1, the highest potential, to 1000.",
+            "Google does not allow filtering or sorting on per-context status or item issues; "
+            "use the issues command for issue diagnostics.",
+        ),
+    )
+
+
+def command_price_competitiveness(args: argparse.Namespace) -> None:
+    where = [equals("report_country_code", country_code(args.country))] if args.country else []
+    run_report(
+        args,
+        "price_competitiveness_product_view",
+        PRICE_COMPETITIVENESS_FIELDS,
+        where,
+        notes=("Benchmark price is the latest benchmark for the product's catalog in the benchmark country.",),
+    )
+
+
+def command_price_insights(args: argparse.Namespace) -> None:
+    run_report(
+        args,
+        "price_insights_product_view",
+        PRICE_INSIGHTS_FIELDS,
+        (),
+        notes=(
+            "Predicted change fractions are Google's forecast for adopting the suggested price.",
+        ),
+    )
+
+
+def command_best_sellers(args: argparse.Namespace) -> None:
+    table, fields = BEST_SELLER_VIEWS[args.view]
+    # Google requires granularity and country conditions; date and category are optional
+    # and default to the latest report and to every top-level category.
+    where = [
+        equals("report_granularity", GRANULARITIES[args.granularity]),
+        equals("report_country_code", country_code(args.country)),
+    ]
+    if args.category:
+        where.append(f"report_category_id = {category_id(args.category)}")
+    if args.date:
+        where.append(f"report_date = {mcql_date(args.date, '--date')}")
+    run_report(
+        args,
+        table,
+        fields,
+        where,
+        order_by="rank",
+        descending=False,
+        notes=(
+            "Without --date Google returns its latest available report.",
+            "Inventory status ignores the report country filter.",
+        ),
+    )
+
+
+def command_competitive_visibility(args: argparse.Namespace) -> None:
+    table, fields, ranked_by = VISIBILITY_VIEWS[args.view]
+    # Google requires a date, a country, and a category on every competitive-visibility
+    # query, and warns that spanning several countries or categories can time out, so
+    # this command sends exactly one of each.
+    where = [
+        date_condition(args),
+        equals("report_country_code", country_code(args.country)),
+        f"report_category_id = {category_id(args.category)}",
+    ]
+    if args.traffic_source:
+        where.append(equals("traffic_source", enum_choice(args.traffic_source, TRAFFIC_SOURCES, "--traffic-source")))
+    run_report(
+        args,
+        table,
+        fields,
+        where,
+        order_by=ranked_by,
+        descending=False,
+        notes=("Competitive visibility covers one country and one category per request.",),
+    )
+
+
+# --- Command line -------------------------------------------------------------------
+
+
+def add_common_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--env-file", help="Load an explicit dotenv after existing process variables")
+    parser.add_argument("--profile", help="Configured Google Merchant profile")
+    parser.add_argument("--json", action="store_true", help="Emit normalized JSON")
+
+
+def add_account_option(parser: argparse.ArgumentParser, default_limit: int) -> None:
+    parser.add_argument("--account", required=True, help="Merchant Center account ID")
+    parser.add_argument("--limit", type=int, default=default_limit)
+
+
+def add_date_window(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--during", default="LAST_30_DAYS",
+        help="Relative range: " + ", ".join(DURING_RANGES),
+    )
+    parser.add_argument("--start-date", help="ISO 8601 start date; requires --end-date")
+    parser.add_argument("--end-date", help="ISO 8601 end date; requires --start-date")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="google-merchant", description="Read bounded Google Merchant Center data."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    profiles = subparsers.add_parser("profiles", help="List configured profiles without a network request")
+    profiles.add_argument("--env-file", help="Load an explicit dotenv after existing process variables")
+    profiles.add_argument("--json", action="store_true", help="Emit normalized JSON")
+    profiles.set_defaults(handler=command_profiles)
+
+    accounts = subparsers.add_parser("accounts", help="List accessible Merchant Center accounts")
+    add_common_options(accounts)
+    accounts.add_argument("--limit", type=int, default=25)
+    accounts.set_defaults(handler=command_accounts)
+
+    status = subparsers.add_parser("status", help="Report product counts by reporting context and country")
+    add_common_options(status)
+    add_account_option(status, 50)
+    status.add_argument("--reporting-context", help="Restrict to one reporting context")
+    status.add_argument("--country", help="Restrict to one two-letter country code")
+    status.set_defaults(handler=command_status)
+
+    issues = subparsers.add_parser("issues", help="Report item-level issues and how many products each affects")
+    add_common_options(issues)
+    add_account_option(issues, 50)
+    issues.add_argument("--reporting-context", help="Restrict to one reporting context")
+    issues.add_argument("--country", help="Restrict to one two-letter country code")
+    issues.set_defaults(handler=command_issues)
+
+    products = subparsers.add_parser("products", help="List products with their serving status")
+    add_common_options(products)
+    add_account_option(products, 50)
+    products.add_argument("--status", help="Restrict to one status: " + ", ".join(PRODUCT_STATUSES))
+    products.add_argument("--brand", help="Restrict to one exact brand")
+    products.add_argument("--reporting-context", help="Restrict statuses to one reporting context")
+    products.set_defaults(handler=command_products)
+
+    performance = subparsers.add_parser("performance", help="Report product impressions, clicks, and conversions")
+    add_common_options(performance)
+    add_account_option(performance, 25)
+    add_date_window(performance)
+    performance.add_argument("--breakdown", choices=sorted(PERFORMANCE_BREAKDOWNS), default="product")
+    performance.add_argument("--marketing-method", help="Restrict to ads or organic")
+    performance.add_argument("--country", help="Restrict to one customer country code")
+    performance.add_argument("--store-type", help="Restrict to online_store or local_stores")
+    performance.set_defaults(handler=command_performance)
+
+    competitiveness = subparsers.add_parser(
+        "price-competitiveness", help="Compare product prices against Google's benchmark"
+    )
+    add_common_options(competitiveness)
+    add_account_option(competitiveness, 50)
+    competitiveness.add_argument("--country", help="Restrict to one benchmark country code")
+    competitiveness.set_defaults(handler=command_price_competitiveness)
+
+    insights = subparsers.add_parser("price-insights", help="Report Google's suggested prices and forecasts")
+    add_common_options(insights)
+    add_account_option(insights, 50)
+    insights.set_defaults(handler=command_price_insights)
+
+    best_sellers = subparsers.add_parser("best-sellers", help="Report the best selling products or brands on Google")
+    add_common_options(best_sellers)
+    add_account_option(best_sellers, 50)
+    best_sellers.add_argument("--view", choices=sorted(BEST_SELLER_VIEWS), default="products")
+    best_sellers.add_argument("--granularity", choices=sorted(GRANULARITIES), default="weekly")
+    best_sellers.add_argument("--country", required=True, help="Two-letter country code")
+    best_sellers.add_argument("--category", help="Numeric Google product category ID")
+    best_sellers.add_argument("--date", help="ISO 8601 report date; defaults to Google's latest report")
+    best_sellers.set_defaults(handler=command_best_sellers)
+
+    visibility = subparsers.add_parser(
+        "competitive-visibility", help="Report visibility against competing domains"
+    )
+    add_common_options(visibility)
+    add_account_option(visibility, 50)
+    add_date_window(visibility)
+    visibility.add_argument("--view", choices=sorted(VISIBILITY_VIEWS), default="benchmark")
+    visibility.add_argument("--country", required=True, help="Two-letter country code")
+    visibility.add_argument("--category", required=True, help="Numeric Google product category ID")
+    visibility.add_argument("--traffic-source", help="Restrict to organic, ads, or all")
+    visibility.set_defaults(handler=command_competitive_visibility)
+
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        load_environment(args.env_file)
+        args.handler(args)
+    except MerchantError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

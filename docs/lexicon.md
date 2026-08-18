@@ -101,3 +101,46 @@ One Lighthouse diagnostic or opportunity within an analysis. Use `audit` for the
 and `category` for Google's performance, accessibility, best-practices, and SEO groupings. Those
 lowercase names are the Lighthouse result keys; the query enums are `PERFORMANCE`, `ACCESSIBILITY`,
 `BEST_PRACTICES`, and `SEO`. Keep the lowercase form everywhere except the request itself.
+
+## Merchant Center
+
+### Merchant account
+
+The Merchant Center account that owns a product feed, identified by its numeric account ID. Use
+`account` within the Merchant skill, where the product boundary is already explicit, and always the
+exact numeric ID. Google's reports serve a standalone account or an individual sub-account; an
+advanced account, formerly a multi-client account, aggregates sub-accounts and has no reports of its
+own. Say `advanced account` rather than `MCA`, which survives only in Google's error strings.
+
+### Reporting context
+
+The Google surface a product status, issue, or report applies to, such as `SHOPPING_ADS` or
+`FREE_LISTINGS`. Use `reporting context` and preserve Google's uppercase enum members verbatim. Do
+not call it a channel; `channel` is a separate product field whose members are `ONLINE` and `LOCAL`.
+
+### Item issue
+
+One feed or policy problem Google attaches to products, carrying a code, a severity, and whether the
+merchant must act. Use `issue` for the finding and `severity` for its impact, whose members are
+`DISAPPROVED`, `DEMOTED`, and `NOT_IMPACTED`. Distinguish an item issue from an account issue, which
+Google models separately with its own severity scale.
+
+### Marketing method
+
+Whether Merchant performance came from paid or unpaid placement. Google's enum members are `ADS` and
+`ORGANIC`; commands accept the lowercase forms and map them at the request boundary. Do not call
+this a channel or a traffic source. `traffic_source` is a distinct competitive-visibility field, and
+Google separately restricts the conversion metrics to its free traffic source.
+
+### Merchant report
+
+A bounded result from the Merchant API's reports service, requested in Merchant Center Query
+Language. Use `report` for the result and name the command after the question it answers, such as
+`performance` or `best-sellers`, rather than after the underlying table. Preserve Google's field
+names verbatim at the API boundary: they are snake_case in a query and camelCase in a response.
+
+### Micros
+
+Google's integer money unit, one millionth of a currency's standard unit, sent as a string alongside
+its currency code. Say `micros` only when discussing the API boundary; report a converted decimal
+amount and its currency to a reader.
