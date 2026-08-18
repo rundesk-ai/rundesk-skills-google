@@ -28,11 +28,15 @@ which are passed to Google verbatim. Supported dimensions are `date`, `country`,
 
 ## Signing in
 
-Rundesk owns Google sign-in. It holds the OAuth app configuration, runs the browser flow, keeps the
-grant sealed, and refreshes tokens. This package holds none of that and declares no credentials: it
-asks Rundesk for one short-lived access token over one end of a socket pair it creates itself,
-and uses that token as a request header only. The token never reaches an argument, an environment
-variable, a file, or any output.
+Rundesk owns Google sign-in. It runs the browser flow, keeps the grant sealed, and refreshes
+tokens. This package holds none of that and declares no credentials: it asks Rundesk for one
+short-lived access token over one end of a socket pair it creates itself, and uses that token as a
+request header only. The token never reaches an argument, an environment variable, a file, or any
+output.
+
+What `google` means — Google's endpoints, identity fields, base scopes, and the scope behind each
+capability — is declared by this catalog's `google-auth` package, which owns sign-in, the account
+listing, and the Google Cloud setup. This package reads nothing from it and never runs it.
 
 ```sh
 rundesk login google
@@ -59,8 +63,8 @@ when a grant is short:
 https://www.googleapis.com/auth/webmasters   every command, including submit-sitemap
 ```
 
-A Rundesk older than managed sign-in cannot answer at all; the command says so and says to update
-Rundesk. There is no other way to authorize this package, and it declares no credentials of its own:
+A Rundesk older than the provider-neutral sign-in bridge cannot answer at all; the command says so
+and says to update Rundesk. There is no other way to authorize this package, and it declares no credentials of its own:
 there is no client ID, client secret, refresh token, dotenv, or `--env-file` to configure.
 
 ## Filtering performance

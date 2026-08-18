@@ -10,10 +10,22 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_SKILLS = {"google-analytics", "google-merchant", "google-pagespeed-insights",
-                   "google-search-console"}
-#: Packages Rundesk signs in to Google for. They declare no credentials and hold no OAuth code.
+EXPECTED_SKILLS = {"google-analytics", "google-auth", "google-merchant",
+                   "google-pagespeed-insights", "google-search-console"}
+#: Packages Rundesk grants a Google capability to. Each declares no credentials and holds no OAuth
+#: code, and each names one capability the provider declaration must carry.
 OAUTH_SKILLS = {"google-analytics", "google-merchant", "google-search-console"}
+#: Every package that speaks the private bridge, including the one that declares the provider.
+BRIDGE_SKILLS = OAUTH_SKILLS | {"google-auth"}
+#: The package that owns Google's declaration, and exactly the schema Rundesk validates it against.
+PROVIDER_SKILL = "google-auth"
+DECLARED = "oauth-provider.json"
+PROVIDER_FIELDS = {"schema", "provider", "display_name", "authorization_endpoint", "token_endpoint",
+                   "identity_endpoint", "base_scopes", "identity", "authorization_parameters",
+                   "client_secret", "capabilities"}
+#: Parameters that belong to the OAuth mechanics; Rundesk refuses a declaration that overrides one.
+RESERVED_PARAMETERS = {"client_id", "redirect_uri", "response_type", "scope", "state",
+                       "code_challenge", "code_challenge_method"}
 ALLOWED_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 DECLARED_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
@@ -55,27 +67,79 @@ class GoogleCatalog(unittest.TestCase):
         self.assertEqual(declared, listed)
 
     def test_google_sign_in_stays_with_rundesk(self):
-        """An OAuth package asks Rundesk for a token and carries no client, grant, or refresh code."""
-        for name in sorted(OAUTH_SKILLS):
+        """A package asks Rundesk over the bridge and carries no client, grant, or refresh code."""
+        for name in sorted(BRIDGE_SKILLS):
             with self.subTest(skill=name):
                 package = ROOT / "skills" / name
                 self.assertFalse((package / "rundesk.json").exists(),
                                  "Rundesk holds the Google client, so there is nothing to declare")
                 runtime = (package / "scripts" / f"{name}.d" / f"{name}.py").read_text(encoding="utf-8")
-                for owned_by_rundesk in ("client_secret", "refresh_token", "oauth2.googleapis.com",
-                                         "CLIENT_ID", "webbrowser"):
-                    self.assertNotIn(owned_by_rundesk, runtime)
-                # The one authorization path: the hidden bridge, its version 1 frame, and the
-                # connected unnamed local socket Rundesk is the only other holder of.
-                for spoken in ('"_google"', '"accounts"', "--response-fd", 'struct.unpack(">I"',
-                               "BRIDGE_VERSION = 1", "socket.socketpair(socket.AF_UNIX"):
+                # `client_secret` is a declared field name in the provider package, and a
+                # credential everywhere else, so only the mechanics are forbidden to all of them.
+                forbidden = ["refresh_token", "oauth2.googleapis.com", "CLIENT_ID",
+                             "CLIENT_SECRET", "webbrowser"]
+                if name != PROVIDER_SKILL:
+                    forbidden.append("client_secret")
+                for owned_by_rundesk in forbidden:
+                    with self.subTest(forbidden=owned_by_rundesk):
+                        self.assertNotIn(owned_by_rundesk, runtime)
+                # The one authorization path: the provider-neutral bridge, its version 1
+                # frame, and the connected unnamed local socket Rundesk is the only other holder of.
+                for spoken in ('BRIDGE = "_oauth"', 'PROVIDER = "google"', '"accounts"',
+                               "--response-fd", 'struct.unpack(">I"', "BRIDGE_VERSION = 1",
+                               "socket.socketpair(socket.AF_UNIX"):
                     self.assertIn(spoken, runtime)
                 # Rundesk refuses a pipe, so a package that made one would fail at every call.
                 self.assertNotIn("os.pipe(", runtime)
 
+    def test_exactly_one_package_declares_the_google_provider(self):
+        """A provider is declared beside one SKILL.md, and Rundesk refuses two of the same name."""
+        declaring = [path.parent.name for path in (ROOT / "skills").glob(f"*/{DECLARED}")]
+        self.assertEqual([PROVIDER_SKILL], declaring)
+        self.assertFalse((ROOT / "providers").exists(),
+                         "a provider is declared by a skill, not by a root directory")
+
+    def test_the_google_declaration_uses_schema_one_exactly(self):
+        declared = json.loads((ROOT / "skills" / PROVIDER_SKILL / DECLARED)
+                              .read_text(encoding="utf-8"))
+        self.assertEqual(PROVIDER_FIELDS, set(declared))
+        self.assertEqual(1, declared["schema"])
+        self.assertEqual("google", declared["provider"])
+        self.assertIsInstance(declared["client_secret"], bool)
+        self.assertEqual({"subject", "email", "email_verified"}, set(declared["identity"]))
+        for field in ("authorization_endpoint", "token_endpoint", "identity_endpoint"):
+            with self.subTest(field=field):
+                self.assertRegex(declared[field], r"^https://[^/@#]+/")
+        scopes = declared["base_scopes"]
+        self.assertTrue(scopes and all(isinstance(one, str) and one.strip() for one in scopes))
+        self.assertEqual(len(scopes), len(set(scopes)))
+        parameters = declared["authorization_parameters"]
+        self.assertEqual(set(), set(parameters) & RESERVED_PARAMETERS)
+        self.assertTrue(all(isinstance(key, str) and isinstance(value, str)
+                            for key, value in parameters.items()))
+        # No client name or value belongs in a declaration; Rundesk prompts for and seals those.
+        raw = (ROOT / "skills" / PROVIDER_SKILL / DECLARED).read_text(encoding="utf-8")
+        for owned_by_rundesk in ("CLIENT_ID", "CLIENT_SECRET", "client_id", "refresh_token"):
+            self.assertNotIn(owned_by_rundesk, raw)
+
+    def test_every_declared_capability_is_one_a_package_here_asks_for(self):
+        declared = json.loads((ROOT / "skills" / PROVIDER_SKILL / DECLARED)
+                              .read_text(encoding="utf-8"))["capabilities"]
+        wanted = set()
+        for name in sorted(OAUTH_SKILLS):
+            runtime = (ROOT / "skills" / name / "scripts" / f"{name}.d"
+                       / f"{name}.py").read_text(encoding="utf-8")
+            capability = re.search(r'(?m)^CAPABILITY = "([a-z0-9-]+)"$', runtime).group(1)
+            wanted.add(capability)
+            with self.subTest(skill=name):
+                self.assertIn(capability, declared)
+                self.assertTrue(declared[capability].startswith(
+                    "https://www.googleapis.com/auth/"))
+        self.assertEqual(wanted, set(declared))
+
     def test_packages_declare_only_what_an_owner_must_supply(self):
         for entry in self.manifest["skills"]:
-            if entry["name"] in OAUTH_SKILLS:
+            if entry["name"] in BRIDGE_SKILLS:
                 continue
             with self.subTest(skill=entry["name"]):
                 package = ROOT / entry["path"]

@@ -43,10 +43,15 @@ def split_csv(value: str) -> List[str]:
 # package owns none of it and asks the install's own CLI for one short-lived access token, which
 # arrives over one connected unnamed local socket held by nothing but these two processes rather
 # than through argv, the environment, stdout, or a file. The wire format is Rundesk's hidden
-# `_google` bridge, version 1. Rundesk refuses a pipe, a named socket, a regular file, and 0, 1, 2.
+# `_oauth` bridge, version 1. Rundesk refuses a pipe, a named socket, a regular file, and 0, 1, 2.
 COMMAND_VARIABLE = "RUNDESK_COMMAND"
-# Which fixed Google scope Rundesk attaches to a token for this package. Rundesk maps the name; the
-# scope itself is never chosen here.
+BRIDGE = "_oauth"
+# Which OAuth provider Rundesk signs in to. What that name means — Google's endpoints, identity
+# fields, and the scope each capability carries — is declared by this catalog's `google-auth`
+# package, which this one reads nothing from and never runs.
+PROVIDER = "google"
+# The capability this package asks for. Rundesk turns it into the scope the provider declares, so no
+# scope is chosen here.
 CAPABILITY = "analytics"
 BRIDGE_VERSION = 1
 MAX_FRAME = 65536
@@ -65,7 +70,7 @@ DIAGNOSTIC_FD = 2
 # A Rundesk released before this bridge answers as argparse does: exit 2, naming the choice it did
 # not recognize. Rundesk's own refusals exit 1, so the two are never mistaken for each other.
 UNSUPPORTED_EXIT = 2
-UNSUPPORTED_MARKS = ("invalid choice: '_google'", "invalid choice: 'login'",
+UNSUPPORTED_MARKS = ("invalid choice: '_oauth'", "invalid choice: 'login'",
                      "invalid choice: 'google'", "unrecognized arguments")
 MAX_REASON = 400
 
@@ -122,9 +127,13 @@ def read_frame(connection: socket.socket, deadline: float) -> Dict[str, Any]:
         raise AnalyticsError("Rundesk sent a malformed Google response.") from exc
     if not isinstance(payload, dict) or payload.get("version") != BRIDGE_VERSION:
         raise AnalyticsError("Rundesk sent a Google response version this package cannot read.")
-    if payload.get("ok") is not True:
-        raise AnalyticsError("Rundesk refused the Google request.")
     return payload
+
+
+def framed_error(payload: Dict[str, Any]) -> str:
+    """The refusal Rundesk framed, bounded. A frame carrying no reason yields nothing."""
+    reason = payload.get("error")
+    return reason.strip()[:MAX_REASON] if isinstance(reason, str) and reason.strip() else ""
 
 
 def bridge_reason(said: str) -> str:
@@ -143,13 +152,16 @@ def unsupported(code: int, said: str) -> bool:
     return code == UNSUPPORTED_EXIT and any(mark in said for mark in UNSUPPORTED_MARKS)
 
 
-def refused(code: int, said: str, profile: str, trouble: str = "") -> AnalyticsError:
+def refused(code: int, said: str, profile: str, framed: str = "",
+            trouble: str = "") -> AnalyticsError:
     if unsupported(code, said):
         return AnalyticsError(
             "This Rundesk install is older than Rundesk-managed Google sign-in. Update Rundesk, "
             f"then run: {login_command(profile)}"
         )
-    reason = bridge_reason(said) or trouble or f"rundesk exited {code}"
+    # Rundesk's framed reason is its structured answer and comes first; its stderr says the same
+    # thing when it could not frame one; the protocol's own complaint is the last resort.
+    reason = framed or bridge_reason(said) or trouble or f"rundesk exited {code}"
     return AnalyticsError(
         f"Rundesk did not grant Google access: {reason}. Run: {login_command(profile)}"
     )
@@ -171,7 +183,7 @@ def finished(process: subprocess.Popen, deadline: float, doing: str) -> Tuple[st
 
 
 def ask_rundesk(action: List[str], profile: str, seconds: Optional[float] = None) -> Dict[str, Any]:
-    """One `_google` answer, read from a socket pair no other process holds an end of."""
+    """One `_oauth` answer, read from a socket pair no other process holds an end of."""
     command = rundesk_command()
     # One deadline for the whole transaction: spawning, reading the frame, and waiting for the exit
     # share it, so a child that stalls in any one phase cannot extend the others.
@@ -180,7 +192,7 @@ def ask_rundesk(action: List[str], profile: str, seconds: Optional[float] = None
     try:
         try:
             process = subprocess.Popen(
-                [command, "_google"] + action + ["--response-fd", str(theirs.fileno())],
+                [command, BRIDGE] + action + ["--response-fd", str(theirs.fileno())],
                 stdin=subprocess.DEVNULL, stdout=DIAGNOSTIC_FD, stderr=subprocess.PIPE,
                 pass_fds=(theirs.fileno(),), text=True,
             )
@@ -203,8 +215,8 @@ def ask_rundesk(action: List[str], profile: str, seconds: Optional[float] = None
         said, code = finished(process, deadline, "the Google request")
     finally:
         ours.close()
-    if code != 0 or not payload:
-        raise refused(code, said, profile, trouble)
+    if code != 0 or payload.get("ok") is not True:
+        raise refused(code, said, profile, framed_error(payload), trouble)
     return payload
 
 
@@ -214,7 +226,8 @@ def profile_action(action: List[str], profile: str) -> List[str]:
 
 def signed_in_accounts(profile: str) -> List[str]:
     """Every Google account Rundesk holds for one OAuth app profile. Local, with no network call."""
-    accounts = ask_rundesk(profile_action(["accounts"], profile), profile).get("accounts")
+    action = profile_action(["accounts", PROVIDER], profile)
+    accounts = ask_rundesk(action, profile).get("accounts")
     if not isinstance(accounts, list) or not all(isinstance(one, str) for one in accounts):
         raise AnalyticsError("Rundesk sent a malformed Google account list.")
     return accounts
@@ -222,14 +235,20 @@ def signed_in_accounts(profile: str) -> List[str]:
 
 def managed_token(profile: str, email: str) -> Tuple[str, str]:
     """One short-lived token and the verified account it belongs to."""
-    action = profile_action(["access", CAPABILITY], profile)
+    action = profile_action(["access", PROVIDER, CAPABILITY], profile)
     payload = ask_rundesk(action + (["--email", email] if email else []), profile)
     token, expires, who = (payload.get("access_token"), payload.get("expires_at"),
                            payload.get("email"))
+    subject = payload.get("subject")
     # bool is an int, and an expiry of True would otherwise pass every check below.
     if (not isinstance(token, str) or not token or not isinstance(who, str) or not who
+            or not isinstance(subject, str) or not subject
             or isinstance(expires, bool) or not isinstance(expires, int)):
         raise AnalyticsError("Rundesk sent no usable Google access token.")
+    # Bearer is the one scheme this package knows how to send, so anything else is refused rather
+    # than sent as though it were one.
+    if payload.get("token_type") != "Bearer":
+        raise AnalyticsError("Rundesk sent a Google access token this package cannot send.")
     if expires <= int(time.time()):
         raise AnalyticsError(
             f"Rundesk sent an already expired Google access token. Run: {login_command(profile)}"

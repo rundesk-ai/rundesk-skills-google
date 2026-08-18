@@ -1005,7 +1005,7 @@ class LauncherTest(unittest.TestCase):
                     parser.parse_args([command])
 
 
-# A stand-in for the Rundesk CLI that answers the hidden `_google` bridge exactly as Rundesk
+# A stand-in for the Rundesk CLI that answers the hidden `_oauth` bridge exactly as Rundesk
 # documents it, including the checks Rundesk makes on the response descriptor before it writes.
 # Every case below therefore fails if this package sends the wrong words, the wrong capability, or a
 # descriptor Rundesk would refuse.
@@ -1019,6 +1019,7 @@ import sys
 import time
 
 MAX_FRAME = 65536
+PROVIDER = "google"
 CAPABILITIES = ("analytics", "merchant", "search-console")
 plan = json.loads(os.environ["FAKE_RUNDESK_PLAN"])
 argv = sys.argv[1:]
@@ -1026,7 +1027,13 @@ with open(plan["record"], "a", encoding="utf-8") as record:
     record.write(json.dumps(argv) + chr(10))
 
 
+framed = None
+
+
 def refuse(said, code=1):
+    reason = said.split(" — ", 1)[-1]
+    if framed is not None and code == 1:
+        answer({{"ok": False, "error": reason}}, stop=False)
     print(said, file=sys.stderr)
     raise SystemExit(code)
 
@@ -1051,7 +1058,7 @@ if argv[0] == "login":
     print("Connected owner@example.test")
     raise SystemExit(0)
 
-if argv[0] != "_google":
+if argv[0] != "_oauth":
     refuse("rundesk: error: argument command: invalid choice: %r" % argv[0], 2)
 
 fd = int(option("--response-fd"))
@@ -1070,14 +1077,7 @@ except OSError:
     refuse("google: FAILED — the response FD must be a connected anonymous local socket")
 finally:
     checked.close()
-
-held = plan["accounts"].get(option("--profile").strip().upper() or "DEFAULT")
-if held is None:
-    refuse("google: FAILED — set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET with "
-           "`rundesk env set` for this OAuth app profile")
-
-
-def answer(payload):
+def answer(payload, stop=True):
     if plan["mode"] == "silent":
         raise SystemExit(0)
     if plan["mode"] == "hang":
@@ -1092,17 +1092,29 @@ def answer(payload):
     os.write(fd, struct.pack(">I", len(body)) + body)
     if plan["mode"] == "frame-then-hang":
         time.sleep(600)
-    raise SystemExit(0)
+    if stop:
+        raise SystemExit(0)
+
+
+framed = fd
+
+if argv[1] not in ("accounts", "access"):
+    refuse("rundesk: error: argument oauth_action: invalid choice: %r" % argv[1], 2)
+if argv[2] != PROVIDER:
+    refuse("oauth: FAILED — there is no installed OAuth provider called %r (available: %s)"
+           % (argv[2], PROVIDER))
+
+held = plan["accounts"].get(option("--profile").strip().upper() or "DEFAULT")
+if held is None:
+    refuse("google: FAILED — set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET with "
+           "`rundesk env set` for this OAuth app profile")
 
 
 if argv[1] == "accounts":
     answer({{"ok": True, "accounts": sorted(held)}})
 
-if argv[1] != "access":
-    refuse("rundesk: error: argument google_action: invalid choice: %r" % argv[1], 2)
-if argv[2] not in CAPABILITIES:
-    refuse("rundesk: error: argument capability: invalid choice: %r (choose from %s)"
-           % (argv[2], ", ".join(repr(one) for one in CAPABILITIES)), 2)
+if argv[3] not in CAPABILITIES:
+    refuse("oauth: FAILED — the google provider declares no capability called %r" % argv[3])
 if plan["mode"] == "scope":
     refuse("google: FAILED — Google did not return a reusable grant for every requested scope")
 
@@ -1118,8 +1130,13 @@ if len(matched) != 1:
 # value in the environment the case runs with.
 email = matched[0]
 expiry = -60 if plan["mode"] == "expired" else 3600
-answer({{"ok": True, "access_token": "access-token-for-" + email,
-        "expires_at": int(plan["now"]) + expiry, "email": email, "sub": "sub-" + email}})
+granted = {{"ok": True, "access_token": "access-token-for-" + email, "token_type": "Bearer",
+           "expires_at": int(plan["now"]) + expiry, "email": email, "subject": "subject-" + email}}
+if plan["mode"] == "wrong-token-type":
+    granted["token_type"] = "mac"
+if plan["mode"] == "no-subject":
+    del granted["subject"]
+answer(granted)
 '''.format(python=sys.executable)
 
 
@@ -1191,10 +1208,11 @@ class RundeskBridgeTest(unittest.TestCase):
         self.assertEqual(0, code, err)
         asked = self.asked()
         self.assertEqual(1, len(asked))
-        self.assertEqual(["_google", "access", "merchant", "--response-fd"], asked[0][:4])
+        self.assertEqual(["_oauth", "access", "google", "merchant", "--response-fd"],
+                         asked[0][:5])
         # The stand-in makes Rundesk's own check, so passing proves an inherited connected unnamed
         # local socket rather than 0, 1, 2, a pipe, a named socket, or a file.
-        self.assertGreater(int(asked[0][4]), 2)
+        self.assertGreater(int(asked[0][5]), 2)
         self.assertEqual(["Bearer " + MANAGED_TOKEN], self.authorization())
         self.assertIn("Example Shop", out)
 
@@ -1208,7 +1226,6 @@ class RundeskBridgeTest(unittest.TestCase):
     def test_frame_must_be_version_one_json_of_the_documented_size(self):
         for body, expected in (
             (json.dumps({"version": 2, "ok": True}).encode(), "version this package cannot read"),
-            (json.dumps({"version": 1, "ok": False}).encode(), "refused the Google request"),
             (b"{not json", "malformed Google response"),
         ):
             with self.subTest(body=body):
@@ -1217,6 +1234,13 @@ class RundeskBridgeTest(unittest.TestCase):
                 theirs.close()
                 with self.assertRaisesRegex(self.module.MerchantError, expected):
                     self.module.read_frame(ours, time.monotonic() + 5)
+
+    def test_a_framed_refusal_carries_its_reason_and_nothing_of_the_frame(self):
+        self.assertEqual("no account", self.module.framed_error({"ok": False, "error": "no account"}))
+        self.assertEqual("", self.module.framed_error({"ok": False}))
+        self.assertEqual("", self.module.framed_error({"ok": False, "error": 7}))
+        self.assertEqual(self.module.MAX_REASON,
+                         len(self.module.framed_error({"ok": False, "error": "x" * 9000})))
 
     def test_frame_larger_than_the_protocol_allows_is_refused_before_reading_it(self):
         ours, theirs = self.pair()
@@ -1241,7 +1265,7 @@ class RundeskBridgeTest(unittest.TestCase):
         self.addCleanup(os.close, read_fd)
         with patch.dict(os.environ, self.environment(), clear=True):
             completed = subprocess.run(
-                [str(self.command), "_google", "accounts", "--response-fd", str(write_fd)],
+                [str(self.command), "_oauth", "accounts", "google", "--response-fd", str(write_fd)],
                 pass_fds=(write_fd,), capture_output=True, text=True, check=False,
             )
         os.close(write_fd)
@@ -1295,9 +1319,9 @@ class RundeskBridgeTest(unittest.TestCase):
         code, _, err = self.invoke(["accounts", "--profile", "acme", "--email", "two@example.test"])
         self.assertEqual(0, code, err)
         self.assertEqual(
-            ["_google", "access", "merchant", "--profile", "acme",
+            ["_oauth", "access", "google", "merchant", "--profile", "acme",
              "--email", "two@example.test"],
-            self.asked()[0][:7],
+            self.asked()[0][:8],
         )
         self.assertEqual(["Bearer access-token-for-two@example.test"], self.authorization())
 
@@ -1314,7 +1338,7 @@ class RundeskBridgeTest(unittest.TestCase):
         self.assertEqual(0, code, err)
         self.assertIn("default,one@example.test,ready", out)
         self.assertIn("default,two@example.test,ready", out)
-        self.assertEqual(["_google", "accounts", "--response-fd"], self.asked()[0][:3])
+        self.assertEqual(["_oauth", "accounts", "google", "--response-fd"], self.asked()[0][:4])
         self.assertEqual([], self.requests)
 
     def test_profiles_says_what_to_run_when_no_account_is_connected(self):
@@ -1345,7 +1369,7 @@ class RundeskBridgeTest(unittest.TestCase):
         self.assertEqual(0, code, err)
         asked = self.asked()
         self.assertEqual(["login", "google", "--profile", "acme"], asked[0])
-        self.assertEqual("access", asked[1][1])
+        self.assertEqual(["access", "google"], asked[1][1:3])
 
     def test_auth_without_a_profile_asks_rundesk_for_its_own_default(self):
         code, out, err = self.invoke(["profiles", "--auth"])
@@ -1358,6 +1382,35 @@ class RundeskBridgeTest(unittest.TestCase):
         self.assertEqual(2, code)
         self.assertIn("Google login was declined", err)
         self.assertEqual([], self.requests)
+
+    def test_a_token_that_is_not_bearer_is_refused_rather_than_sent(self):
+        self.plan["mode"] = "wrong-token-type"
+        code, _, err = self.invoke(["accounts"])
+        self.assertEqual(2, code)
+        self.assertIn("cannot send", err)
+        self.assertEqual([], self.requests)
+
+    def test_a_grant_without_a_subject_is_refused(self):
+        self.plan["mode"] = "no-subject"
+        code, _, err = self.invoke(["accounts"])
+        self.assertEqual(2, code)
+        self.assertIn("no usable Google access token", err)
+        self.assertEqual([], self.requests)
+
+    def test_a_framed_refusal_is_read_from_the_socket_rather_than_from_stderr(self):
+        self.plan["accounts"] = {"ACME": []}
+        code, _, err = self.invoke(["accounts", "--profile", "acme"])
+        self.assertEqual(2, code)
+        # Rundesk frames the reason and also says it; the framed one is what this package reports.
+        self.assertIn("no matching Google profile is connected", err)
+        self.assertNotIn("oauth: FAILED", err)
+        self.assertIn("rundesk login google --profile acme", err)
+
+    def test_an_unknown_provider_or_capability_is_reported_as_rundesk_framed_it(self):
+        with patch.object(self.module, "PROVIDER", "nowhere"):
+            code, _, err = self.invoke(["accounts"])
+        self.assertEqual(2, code)
+        self.assertIn("no installed OAuth provider called 'nowhere'", err)
 
     def test_an_expired_token_is_refused_rather_than_sent_to_google(self):
         self.plan["mode"] = "expired"

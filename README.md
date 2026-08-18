@@ -13,6 +13,7 @@ Google resources it needs.
 ```sh
 rundesk skills install https://github.com/rundesk-ai/rundesk-skills-google
 rundesk skills install https://github.com/rundesk-ai/rundesk-skills-google --confirm
+rundesk skills grant <agent> rundesk-skills-google/google-auth
 rundesk skills grant <agent> rundesk-skills-google/google-search-console
 rundesk skills grant <agent> rundesk-skills-google/google-analytics
 rundesk skills grant <agent> rundesk-skills-google/google-pagespeed-insights
@@ -32,9 +33,12 @@ rundesk skills remove rundesk-skills-google --confirm
 
 ## Signing in to Google
 
-Rundesk owns Google sign-in for every OAuth package here. It holds the OAuth app configuration, runs
-the browser flow, keeps the grant sealed, and refreshes tokens; a package declares no credentials and
-receives one short-lived access token over a private socket when it runs.
+Rundesk owns Google sign-in for every OAuth package here. It runs the browser flow, keeps the grant
+sealed, and refreshes tokens; a package declares no credentials and receives one short-lived access
+token over a private socket when it runs. What Google *is* — its endpoints, identity fields, base
+scopes, and one scope per capability — is declared by the `google-auth` package in this catalog, in
+`oauth-provider.json` beside its `SKILL.md`. Rundesk supplies the mechanics and reads that
+declaration; no catalog package carries OAuth code.
 
 ```sh
 rundesk login google
@@ -68,6 +72,8 @@ in their owning package instead of turning the lexicon into a field inventory.
 
 ## Included skills
 
+- `google-auth` — the catalog's Google OAuth provider definition, the accounts Rundesk holds, and
+  the browser sign-in the other Google skills depend on.
 - `google-search-console` — accessible sites, bounded and filterable search performance reports,
   sitemaps, URL inspection, and confirmation-guarded sitemap submission.
 - `google-analytics` — accessible GA4 accounts and properties, bounded traffic, audience, key-event,

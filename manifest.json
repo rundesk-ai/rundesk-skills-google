@@ -2,8 +2,9 @@
   "schema": 1,
   "name": "rundesk-skills-google",
   "version": "0.1.0",
-  "description": "Guarded Google Search Console, Google Analytics, PageSpeed Insights, and Merchant Center integrations.",
+  "description": "Guarded Google Search Console, Google Analytics, PageSpeed Insights, and Merchant Center integrations with Rundesk-managed Google sign-in.",
   "skills": [
+    {"name": "google-auth", "path": "skills/google-auth"},
     {"name": "google-search-console", "path": "skills/google-search-console"},
     {"name": "google-analytics", "path": "skills/google-analytics"},
     {"name": "google-pagespeed-insights", "path": "skills/google-pagespeed-insights"},

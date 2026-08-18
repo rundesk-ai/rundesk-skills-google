@@ -21,7 +21,9 @@ what the selected account can reach:
 `--profile` names a Google OAuth app profile and `--email` names one signed-in account within it;
 both are needed only when Rundesk holds more than one. When nothing is connected, the command says
 so and names the command to run. Ask the owner to run `rundesk login google` in their own terminal,
-or pass `--auth` to run that sign-in from here when a browser is available.
+or pass `--auth` to run that sign-in from here when a browser is available. The
+`google-auth` skill in this catalog owns sign-in, the list of connected accounts, and the
+Google Cloud setup.
 
 Never guess a profile, an account, or a property. Use the exact numeric property ID returned by
 `properties`.

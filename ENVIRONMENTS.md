@@ -19,8 +19,8 @@ ship a self-contained executable with explicit owner approval.
 
 Rundesk owns Google OAuth. A package that reaches a Google API declares no client ID, client secret,
 or refresh token, keeps no grant, and contains no OAuth, browser, refresh, or persistence code. It
-asks the install's own CLI for one short-lived access token through Rundesk's hidden `_google`
-bridge, naming only the fixed capability it needs. The answer arrives over one end of an inherited
+asks the install's own CLI for one short-lived access token through Rundesk's hidden, provider-
+neutral `_oauth` bridge, naming only the provider and the fixed capability it needs. The answer arrives over one end of an inherited
 anonymous local socket pair as a single length-prefixed JSON frame, so a token never reaches an
 argument, an environment variable, stdout, stderr, a log, or a file. Rundesk refuses any other
 descriptor, including a pipe, a named socket, a regular file, and standard input or output.
@@ -40,6 +40,17 @@ run. A Rundesk too old to answer the bridge is reported as that, not as a Google
 
 A new Google package uses this same bridge and its capability name. Do not add a second way to
 authorize.
+
+Google's own definition — endpoints, identity fields, base scopes, authorization parameters, and one
+scope per capability — belongs to this catalog, in `skills/google-auth/oauth-provider.json` beside
+that package's `SKILL.md`. Rundesk supplies the mechanics and reads the declaration; no package here
+states any mechanics of its own. A declaration may not name `client_id`, `redirect_uri`,
+`response_type`, `scope`, `state`, `code_challenge`, or `code_challenge_method`, and Rundesk refuses
+one that does. `skills/google-auth/references/cli.md` owns the Google Cloud setup an owner follows
+once, so no other repository needs to describe it.
+
+Exactly one installed skill may declare a given provider. Adding another Google API means adding one
+capability and its scope to that declaration, not a second declaration.
 
 ## Owner-supplied values
 
