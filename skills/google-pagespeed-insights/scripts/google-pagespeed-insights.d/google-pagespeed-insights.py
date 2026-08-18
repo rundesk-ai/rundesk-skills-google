@@ -276,6 +276,15 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     lighthouse = expect_object(response.get("lighthouseResult", {}), "Lighthouse result")
     if not lighthouse:
         raise PageSpeedError("Google returned no Lighthouse result for the requested URL.")
+    runtime_error = expect_object(lighthouse.get("runtimeError", {}), "Lighthouse runtime error")
+    if runtime_error:
+        code = expect_text(runtime_error, "code", "Lighthouse runtime error code")
+        message = expect_text(runtime_error, "message", "Lighthouse runtime error message")
+        detail = ": ".join(value for value in (code, message) if value)
+        raise PageSpeedError(
+            "Google could not complete the Lighthouse assessment"
+            + (f": {detail}." if detail else ".")
+        )
     returned_categories = expect_object(lighthouse.get("categories", {}), "Lighthouse categories object")
     audits = expect_object(lighthouse.get("audits", {}), "Lighthouse audits object")
     common = {
