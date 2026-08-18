@@ -41,6 +41,37 @@ METRICS = {
     "cumulative-layout-shift": "cumulative_layout_shift",
     "interaction-to-next-paint": "interaction_to_next_paint",
 }
+# Field data is the Chrome UX Report summary runPagespeed already returns beside the lab run.
+# `loadingExperience` is asked about the requested page and `originLoadingExperience` about the whole
+# origin, so each is reported under the scope it was requested for, never merged.
+FIELD_SCOPES = (("url", "loadingExperience"), ("origin", "originLoadingExperience"))
+# The v5 reference documents the metrics map key only as `(key)`, so the raw key is reported on every
+# row and an unrecognized key is passed through lowercased instead of dropped. A display name is only
+# shared with a lab metric where the two measure the same quantity in the same unit.
+MILLISECONDS = "milliseconds"
+# CUMULATIVE_LAYOUT_SHIFT_SCORE is typed as an integer while Lighthouse reports CLS as a unitless
+# ratio, and no Google page states the relationship. The name and unit keep the raw integer from
+# being read as a Lighthouse CLS value; nothing is rescaled.
+API_INTEGER = "api_integer"
+API_VALUE = "api_value"
+FIELD_METRICS = {
+    "FIRST_CONTENTFUL_PAINT_MS": ("first_contentful_paint", MILLISECONDS),
+    "LARGEST_CONTENTFUL_PAINT_MS": ("largest_contentful_paint", MILLISECONDS),
+    "CUMULATIVE_LAYOUT_SHIFT_SCORE": ("cumulative_layout_shift_score_raw", API_INTEGER),
+    "INTERACTION_TO_NEXT_PAINT": ("interaction_to_next_paint", MILLISECONDS),
+    "FIRST_INPUT_DELAY_MS": ("first_input_delay", MILLISECONDS),
+    "EXPERIMENTAL_TIME_TO_FIRST_BYTE": ("experimental_time_to_first_byte", MILLISECONDS),
+}
+FIELD_CATEGORIES = ("FAST", "AVERAGE", "SLOW", "NONE")
+# Returned proportions are rounded, so their total is checked with room for that rounding only.
+DISTRIBUTION_TOLERANCE = 0.02
+LAB_COLUMNS = ["row_type", "category", "metric", "audit", "title", "score", "value",
+               "numeric_value", "display_value", "weight"]
+FIELD_COLUMNS = ["requested_scope", "effective_scope", "origin_fallback", "field_id",
+                 "field_metric_key", "unit", "percentile", "field_category"]
+DISTRIBUTION_COLUMNS = ["bucket_min", "bucket_max", "proportion"]
+CONTEXT_COLUMNS = ["requested_url", "final_url", "strategy", "fetch_time", "lighthouse_version",
+                   "profile"]
 
 
 class PageSpeedError(RuntimeError):
@@ -202,6 +233,62 @@ def optional_number(container: dict[str, Any], key: str, noun: str) -> int | flo
     return value
 
 
+def optional_flag(container: dict[str, Any], key: str, noun: str) -> bool | None:
+    """Only a real JSON boolean is accepted; an unreported flag is not a false one."""
+    value = container.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise PageSpeedError(f"Google returned a malformed {noun}.")
+    return value
+
+
+def flag_text(value: bool | None) -> str:
+    """Both output modes render a flag identically, and an absent flag stays visibly absent."""
+    return "" if value is None else ("true" if value else "false")
+
+
+def expect_category(container: dict[str, Any], key: str, noun: str) -> str:
+    """An unlisted value would be reported as though it were a real classification."""
+    value = expect_text(container, key, noun)
+    if value and value not in FIELD_CATEGORIES:
+        raise PageSpeedError(f"Google returned an unknown {noun}: {value}.")
+    return value
+
+
+def check_buckets(buckets: list[tuple[Any, Any, Any]], noun: str) -> None:
+    """A distribution is only readable if its buckets tile a range once and account for everyone.
+
+    An absent or empty list stays acceptable; a list Google did send must be complete, because a
+    partial one silently understates how many experiences were poor.
+    """
+    if not buckets:
+        return
+    total = 0.0
+    previous_max = None
+    for index, (minimum, maximum, proportion) in enumerate(buckets):
+        if proportion is None:
+            raise PageSpeedError(f"Google returned a {noun} bucket without a proportion.")
+        if not 0 <= proportion <= 1:
+            raise PageSpeedError(f"Google returned a {noun} proportion outside 0 to 1: {proportion}.")
+        total += proportion
+        # Ordering and overlap cannot be judged without a lower bound, so one is required here.
+        if minimum is None:
+            raise PageSpeedError(f"Google returned a {noun} bucket without a minimum.")
+        if minimum < 0 or (maximum is not None and maximum < 0):
+            raise PageSpeedError(f"Google returned a negative {noun} bound.")
+        # Only the final bucket may be open ended, which also allows at most one of them.
+        if maximum is None and index != len(buckets) - 1:
+            raise PageSpeedError(f"Google returned an open-ended {noun} bucket before the last one.")
+        if maximum is not None and maximum < minimum:
+            raise PageSpeedError(f"Google returned a {noun} bucket ending before it starts.")
+        if previous_max is not None and minimum < previous_max:
+            raise PageSpeedError(f"Google returned overlapping or unordered {noun} buckets.")
+        previous_max = maximum
+    if abs(total - 1) > DISTRIBUTION_TOLERANCE:
+        raise PageSpeedError(f"Google returned {noun} proportions totalling {total:.4f} rather than 1.")
+
+
 def refuse_non_finite(token: str) -> float:
     raise PageSpeedError(f"Google returned the non-finite JSON value {token}.")
 
@@ -250,13 +337,14 @@ def write_rows(rows: list[dict[str, Any]], columns: list[str], as_json: bool) ->
     sys.stdout.write(output.getvalue())
 
 
-def cmd_profiles(args: argparse.Namespace) -> None:
+def cmd_profiles(args: argparse.Namespace) -> int:
     rows = [{
         "profile": name,
         "label": profile_value(name, LABEL) or name,
         "status": "ready" if profile_value(name, API_KEY) else "missing 1",
     } for name in discovered_profiles()]
     write_rows(rows, ["profile", "label", "status"], args.json)
+    return 0
 
 
 def valid_url(value: str) -> str:
@@ -266,7 +354,92 @@ def valid_url(value: str) -> str:
     return value
 
 
-def cmd_analyze(args: argparse.Namespace) -> None:
+def scope_rows(experience: dict[str, Any], scope: str, common: dict[str, Any], *, distributions: bool) -> list[dict[str, Any]]:
+    raw_metrics = experience.get("metrics")
+    metrics = {} if raw_metrics is None else expect_object(raw_metrics, f"{scope} field metrics object")
+    # Documented metrics keep their published order and anything Google adds later follows sorted,
+    # so row order does not depend on JSON key order.
+    ordered = [key for key in FIELD_METRICS if key in metrics]
+    ordered += sorted(key for key in metrics if key not in FIELD_METRICS)
+    fallback = optional_flag(experience, "origin_fallback", f"{scope} field origin fallback")
+    # A page without enough samples is answered with origin data. Reporting only the scope that was
+    # asked about would present site-wide data as the page's, so both are named on every row.
+    attribution = {
+        **common,
+        "requested_scope": scope,
+        "effective_scope": "origin" if scope == "url" and fallback else scope,
+        "origin_fallback": flag_text(fallback),
+        "field_id": expect_text(experience, "id", f"{scope} field data id"),
+    }
+    rows = [{
+        **attribution,
+        "row_type": "field_summary",
+        "field_category": expect_category(experience, "overall_category", f"{scope} field overall category"),
+    }]
+    for key in ordered:
+        metric = expect_object(metrics[key], f"{scope} {key} field metric object")
+        percentile = optional_number(metric, "percentile", f"{scope} {key} field metric percentile")
+        category = expect_category(metric, "category", f"{scope} {key} field metric category")
+        # Buckets are parsed and checked whether or not they are printed, so --field-data never
+        # decides which responses are refused.
+        buckets = [(
+            optional_number(bucket, "min", f"{scope} {key} field distribution minimum"),
+            optional_number(bucket, "max", f"{scope} {key} field distribution maximum"),
+            optional_number(bucket, "proportion", f"{scope} {key} field distribution proportion"),
+        ) for bucket in expect_objects(metric, "distributions", f"{scope} {key} field distribution")]
+        check_buckets(buckets, f"{scope} {key} field distribution")
+        if percentile is None and not category and not buckets:
+            continue
+        name, unit = FIELD_METRICS.get(key, (key.lower(), API_VALUE))
+        # The raw key travels with every row so a display name never has to carry the whole meaning.
+        measured = {**attribution, "metric": name, "field_metric_key": key, "unit": unit}
+        rows.append({**measured, "row_type": "field_metric",
+                     "percentile": "" if percentile is None else percentile,
+                     "field_category": category})
+        if not distributions:
+            continue
+        for minimum, maximum, proportion in buckets:
+            rows.append({**measured, "row_type": "field_distribution",
+                         "bucket_min": "" if minimum is None else minimum,
+                         "bucket_max": "" if maximum is None else maximum,
+                         "proportion": "" if proportion is None else proportion})
+    return rows
+
+
+def field_rows(response: dict[str, Any], common: dict[str, Any], *, distributions: bool) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for scope, key in FIELD_SCOPES:
+        raw = response.get(key)
+        # A field-data object Google omits or nulls carries no data; a wrong-shaped one is refused.
+        if raw is None:
+            continue
+        experience = expect_object(raw, f"{scope} field data")
+        if experience:
+            rows.extend(scope_rows(experience, scope, common, distributions=distributions))
+    return rows
+
+
+def analyze_columns(field_data: str) -> list[str]:
+    columns = list(LAB_COLUMNS)
+    if field_data != "none":
+        columns += FIELD_COLUMNS
+    if field_data == "distributions":
+        columns += DISTRIBUTION_COLUMNS
+    return columns + CONTEXT_COLUMNS
+
+
+def runtime_failure(lighthouse: dict[str, Any]) -> str:
+    """The reported reason Lighthouse produced no assessment, or empty when it produced one."""
+    runtime_error = expect_object(lighthouse.get("runtimeError", {}), "Lighthouse runtime error")
+    if not runtime_error:
+        return ""
+    code = expect_text(runtime_error, "code", "Lighthouse runtime error code")
+    message = expect_text(runtime_error, "message", "Lighthouse runtime error message")
+    detail = ": ".join(value for value in (code, message) if value)
+    return "Google could not complete the Lighthouse assessment" + (f": {detail}." if detail else ".")
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
     profile = selected_profile(args)
     categories = args.category or ["performance"]
     params = [("url", args.url), ("strategy", STRATEGIES[args.strategy])]
@@ -276,17 +449,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     lighthouse = expect_object(response.get("lighthouseResult", {}), "Lighthouse result")
     if not lighthouse:
         raise PageSpeedError("Google returned no Lighthouse result for the requested URL.")
-    runtime_error = expect_object(lighthouse.get("runtimeError", {}), "Lighthouse runtime error")
-    if runtime_error:
-        code = expect_text(runtime_error, "code", "Lighthouse runtime error code")
-        message = expect_text(runtime_error, "message", "Lighthouse runtime error message")
-        detail = ": ".join(value for value in (code, message) if value)
-        raise PageSpeedError(
-            "Google could not complete the Lighthouse assessment"
-            + (f": {detail}." if detail else ".")
-        )
-    returned_categories = expect_object(lighthouse.get("categories", {}), "Lighthouse categories object")
-    audits = expect_object(lighthouse.get("audits", {}), "Lighthouse audits object")
+    failure = runtime_failure(lighthouse)
     common = {
         "requested_url": expect_text(lighthouse, "requestedUrl", "requested URL") or args.url,
         "final_url": expect_text(lighthouse, "finalUrl", "final URL"),
@@ -295,6 +458,22 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         "lighthouse_version": expect_text(lighthouse, "lighthouseVersion", "Lighthouse version"),
         "profile": profile.name,
     }
+    # Requested field data is validated before anything is written, so a malformed response still
+    # produces no output whether or not Lighthouse also failed.
+    field = [] if args.field_data == "none" else field_rows(
+        response, common, distributions=args.field_data == "distributions")
+    columns = analyze_columns(args.field_data)
+    if failure:
+        # The lab half of the request failed, so no lab row is invented. Field data that was asked
+        # for and survived validation is still worth reporting, but analyze was only partly
+        # satisfied, so the exit status stays a failure.
+        if not field:
+            raise PageSpeedError(failure)
+        print(f"ERROR: {failure}", file=sys.stderr)
+        write_rows(field, columns, args.json)
+        return 2
+    returned_categories = expect_object(lighthouse.get("categories", {}), "Lighthouse categories object")
+    audits = expect_object(lighthouse.get("audits", {}), "Lighthouse audits object")
     summaries = []
     for category in categories:
         result = expect_object(returned_categories.get(category, {}), f"{category} category object")
@@ -328,9 +507,11 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     findings.sort(key=lambda item: (-item["weight"], item["score"], item["audit"]))
     if len(findings) > args.audit_limit:
         print(f"WARNING: audit output truncated to {args.audit_limit} findings.", file=sys.stderr)
-    rows = summaries + metrics + findings[:args.audit_limit]
-    columns = ["row_type", "category", "metric", "audit", "title", "score", "value", "numeric_value", "display_value", "weight", "requested_url", "final_url", "strategy", "fetch_time", "lighthouse_version", "profile"]
-    write_rows(rows, columns, args.json)
+    if args.field_data != "none" and not field:
+        # Silence would read as good field data; this URL and origin simply have no CrUX samples.
+        print("NOTE: Google returned no Chrome UX Report field data for this URL or origin.", file=sys.stderr)
+    write_rows(summaries + metrics + field + findings[:args.audit_limit], columns, args.json)
+    return 0
 
 
 def parser() -> argparse.ArgumentParser:
@@ -348,6 +529,8 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--strategy", choices=list(STRATEGIES), default="mobile")
     command.add_argument("--category", action="append", choices=list(CATEGORIES))
     command.add_argument("--audit-limit", type=int, default=10)
+    # Default off: an existing caller's output must not change shape because field data was added.
+    command.add_argument("--field-data", choices=["summary", "distributions", "none"], default="none")
     command.set_defaults(func=cmd_analyze)
     return result
 
@@ -358,8 +541,7 @@ def main(argv: list[str] | None = None) -> int:
         load_dotenv(resolve_env_file(args.env_file), required=bool(args.env_file))
         if hasattr(args, "audit_limit") and not 0 <= args.audit_limit <= 50:
             raise PageSpeedError("--audit-limit must be between 0 and 50.")
-        args.func(args)
-        return 0
+        return args.func(args)
     except PageSpeedError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
