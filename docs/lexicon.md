@@ -61,6 +61,25 @@ A bounded result from the Google Analytics Data API. Use `report` for historical
 `realtime` for the Realtime API. Preserve Google-defined metric and dimension names verbatim at the
 API boundary.
 
+### Breakdown
+
+The dimension a bounded report groups by, named for the question rather than the API field, such as
+`channel`, `country`, or `brand`. Use `breakdown` for the command option and the concept. It is not
+a segment, a filter, or a comparison; it only chooses the grouping the package already supports.
+
+### Key event
+
+An event a property marks as significant, and the name Google adopted in 2024 for what it
+previously called a conversion. Use `key event` in commands, documentation, and output, including
+for lead measurement. Say `conversion` only when quoting older Google material, and never mix the
+two in one sentence.
+
+### Item
+
+A product in Google Analytics ecommerce measurement. Use `item` for the API-facing concept and
+`product` only in prose about a shop. An item exists in Analytics because the site sent an ecommerce
+event about it; it is not a Merchant Center product and carries no feed, price, or availability.
+
 ## PageSpeed Insights
 
 ### Analysis
