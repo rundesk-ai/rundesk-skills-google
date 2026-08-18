@@ -56,6 +56,8 @@ Read these columns together or the reading is wrong:
 - `effective_scope` is what the data actually describes. `url`/`origin` means the page had too few
   samples and Google answered with site-wide data. Report it as the site's, never as the page's.
   `effective_scope` alone cannot tell a fallback from a genuine origin reading; name both.
+- `origin_fallback` is `true` only when Google said the page fell back to origin data. Google omits
+  the field in the common case, so `false` covers both "Google said false" and "Google said nothing".
 - `field_category` is Google's own `FAST`, `AVERAGE`, `SLOW`, or `NONE`. `NONE` means insufficient
   data, not a good result.
 - `unit` says how to read `percentile` and the bucket bounds. `milliseconds` is a duration.
@@ -72,9 +74,20 @@ An empty `percentile` means Google reported no value; `0` is a real measurement.
 field-data object with no data produces no row at all, and a note on stderr when neither object has
 data. Never fill either with a zero.
 
-If Lighthouse could not complete but requested field data is valid, the command prints the field
-rows, reports the Lighthouse failure on stderr, and still exits non-zero. Report the field data and
-say plainly that the lab assessment failed.
+Field rows are bounded by `--field-limit`, which defaults to 100 and holds a complete current
+response. A drop is always reported on stderr; if you see that warning, say the field reading is
+partial rather than presenting it as the whole picture.
+
+Read stderr and the exit status together. `analyze` exits 0 only when every section asked for was
+produced. A `WARNING:` is a bound that was honoured and a `NOTE:` is data Google did not have, both
+with status 0. An `ERROR:` with status 2 means a requested section did not happen, and any rows on
+stdout are the sections that did:
+
+- Lighthouse failed but requested field data is valid: the field rows are printed. Report them and
+  say plainly that the lab assessment failed.
+- Requested field data is malformed but Lighthouse succeeded: the lab rows are printed in full.
+  Report the assessment normally and say the field data could not be read; never treat the non-zero
+  status as invalidating the lab result.
 
 This package is read-only. It cannot change a webpage, hosting configuration, Search Console
 property, Analytics property, or Google Cloud project.
