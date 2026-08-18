@@ -16,6 +16,7 @@ rundesk skills install https://github.com/rundesk-ai/rundesk-skills-google --con
 rundesk skills grant <agent> rundesk-skills-google/google-search-console
 rundesk skills grant <agent> rundesk-skills-google/google-analytics
 rundesk skills grant <agent> rundesk-skills-google/google-pagespeed-insights
+rundesk skills grant <agent> rundesk-skills-google/google-merchant
 ```
 
 Installation previews until `--confirm`, installs every package, and grants none automatically.
@@ -49,6 +50,10 @@ Every command is self-contained and uses only Python's standard library. Runtime
 their owning package. Search Console and Analytics may follow the same catalog conventions, but
 they do not share Python modules, token files, caches, or an undocumented runtime.
 
+Merchant Center is deliberately separate from Analytics: Analytics measures a site's own
+sessions and revenue, while Merchant Center holds the product feed, its approval state, and how
+those products perform on Google's surfaces.
+
 Recurring names and product boundaries are defined in the high-level
 [Google integration lexicon](docs/lexicon.md). API-specific fields and one-off command options stay
 in their owning package instead of turning the lexicon into a field inventory.
@@ -61,5 +66,7 @@ in their owning package instead of turning the lexicon into a field inventory.
   and ecommerce reports, plus direct Analytics Data API queries.
 - `google-pagespeed-insights` — bounded Lighthouse scores, lab metrics, and prioritized audit
   findings for public webpages.
+- `google-merchant` — Merchant Center accounts, product serving status, item-issue diagnostics,
+  bounded product performance reports, and Google's price and market insights.
 
 Maintainers use [RELEASING.md](RELEASING.md).

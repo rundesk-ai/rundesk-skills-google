@@ -10,7 +10,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_SKILLS = {"google-analytics", "google-pagespeed-insights", "google-search-console"}
+EXPECTED_SKILLS = {"google-analytics", "google-merchant", "google-pagespeed-insights",
+                   "google-search-console"}
 ALLOWED_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 DECLARED_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
