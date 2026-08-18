@@ -71,10 +71,14 @@ established Google Analytics concept.
 
 ### Strategy
 
-The PageSpeed Insights device-emulation choice. Preserve Google's `mobile` and `desktop` values.
-Do not call this a device because it does not identify a physical device.
+The PageSpeed Insights device-emulation choice. Use lowercase `mobile` and `desktop` in commands,
+documentation, and output; the API's own query enums are uppercase `MOBILE` and `DESKTOP`, and the
+command maps to them at the request boundary. Do not call this a device because it does not identify
+a physical device.
 
 ### Audit
 
 One Lighthouse diagnostic or opportunity within an analysis. Use `audit` for the individual result
-and `category` for Google's performance, accessibility, best-practices, and SEO groupings.
+and `category` for Google's performance, accessibility, best-practices, and SEO groupings. Those
+lowercase names are the Lighthouse result keys; the query enums are `PERFORMANCE`, `ACCESSIBILITY`,
+`BEST_PRACTICES`, and `SEO`. Keep the lowercase form everywhere except the request itself.

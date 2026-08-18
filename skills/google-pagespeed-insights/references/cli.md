@@ -17,6 +17,18 @@ The command reports category scores, selected lab metrics, and the highest-weigh
 score is below 1. Audits without a numeric score are omitted from the compact finding list. Google
 may return a final analyzed URL after redirects; both requested and final URLs are reported.
 
+`--strategy` and `--category` stay lowercase at the command line and in output. The request maps
+them to the uppercase enums the v5 discovery document defines: `MOBILE` and `DESKTOP`, and
+`PERFORMANCE`, `ACCESSIBILITY`, `BEST_PRACTICES`, and `SEO`. The lowercase names are also the keys
+Lighthouse uses inside the response, so they are what appears in the `category` column.
+
+The Lighthouse result is validated before use: the result, its `categories` and `audits` objects,
+each category object, each `auditRefs` list and element, and each audit object must have the shape
+the API documents. Scores, audit-reference weights, and numeric metric values must be finite
+numbers. A malformed, null, or wrong-shaped response is reported on stderr and exits 2 rather than
+producing a partial reading, and JSON output never contains `NaN` or `Infinity`, which are not
+valid JSON.
+
 ## API key and profiles
 
 Create an API key in a Google Cloud project with the PageSpeed Insights API enabled, restrict it to
@@ -67,10 +79,12 @@ skills/google-pagespeed-insights/scripts/google-pagespeed-insights --help
 skills/google-pagespeed-insights/scripts/google-pagespeed-insights profiles
 ```
 
-Tests are offline and replace the Google API network boundary with synthetic responses.
+Tests are offline and replace the Google API network boundary with synthetic responses, including
+hostile fixtures for null, wrong-shaped, and non-finite values.
 
 ## Official references
 
 - [PageSpeed Insights API](https://developers.google.com/speed/docs/insights/rest)
 - [Get started](https://developers.google.com/speed/docs/insights/v5/get-started)
 - [runPagespeed method](https://developers.google.com/speed/docs/insights/rest/v5/pagespeedapi/runpagespeed)
+- [PageSpeed Insights v5 discovery document](https://pagespeedonline.googleapis.com/$discovery/rest?version=v5)

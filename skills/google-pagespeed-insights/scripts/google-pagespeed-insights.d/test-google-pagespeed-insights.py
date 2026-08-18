@@ -6,7 +6,9 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import math
 import os
+import socket
 import subprocess
 import sys
 import unittest
@@ -43,6 +45,23 @@ class Response:
 
     def read(self):
         return json.dumps(self.payload).encode()
+
+
+class RawResponse(Response):
+    """A response body Google never should have sent, kept exactly as received."""
+
+    def read(self):
+        return self.payload
+
+
+NAN = float("nan")
+INFINITY = float("inf")
+
+
+def lighthouse(categories=None, audits=None, **extra):
+    result = {"categories": categories if categories is not None else {}, "audits": audits if audits is not None else {}}
+    result.update(extra)
+    return {"lighthouseResult": result}
 
 
 class PageSpeedTest(unittest.TestCase):
@@ -114,7 +133,8 @@ class PageSpeedTest(unittest.TestCase):
         ) as request, redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
             self.module.cmd_analyze(args)
         params = request.call_args.args[0]
-        self.assertEqual([value for key, value in params if key == "category"], ["performance", "seo"])
+        self.assertEqual([value for key, value in params if key == "category"], ["PERFORMANCE", "SEO"])
+        self.assertIn(("strategy", "MOBILE"), params)
         self.assertIn(("key", "secret-key"), params)
         rows = json.loads(output.getvalue())
         self.assertEqual([82, 95], [row["score"] for row in rows if row["row_type"] == "summary"])
@@ -142,6 +162,184 @@ class PageSpeedTest(unittest.TestCase):
             code = self.module.main(["analyze", "--profile", "example", "--url", "https://example.test/", "--audit-limit", "51"])
         self.assertEqual(2, code)
         self.assertIn("between 0 and 50", error.getvalue())
+
+    def test_request_uses_the_official_uppercase_discovery_enums(self):
+        # https://pagespeedonline.googleapis.com/$discovery/rest?version=v5 defines the query enums
+        # as MOBILE/DESKTOP and PERFORMANCE/ACCESSIBILITY/BEST_PRACTICES/SEO.
+        self.assertEqual({"mobile": "MOBILE", "desktop": "DESKTOP"}, self.module.STRATEGIES)
+        self.assertEqual(
+            {"performance": "PERFORMANCE", "accessibility": "ACCESSIBILITY",
+             "best-practices": "BEST_PRACTICES", "seo": "SEO"},
+            self.module.CATEGORIES,
+        )
+        for strategy, expected in self.module.STRATEGIES.items():
+            with self.subTest(strategy=strategy):
+                args = SimpleNamespace(
+                    profile="example", url="https://example.test/", strategy=strategy,
+                    category=list(self.module.CATEGORIES), audit_limit=10, json=True,
+                )
+                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                    self.module, "request_json", return_value=lighthouse()
+                ) as request, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.module.cmd_analyze(args)
+                self.assertEqual(
+                    [("url", "https://example.test/"), ("strategy", expected),
+                     ("category", "PERFORMANCE"), ("category", "ACCESSIBILITY"),
+                     ("category", "BEST_PRACTICES"), ("category", "SEO"),
+                     ("key", "secret-key")],
+                    request.call_args.args[0],
+                )
+
+    def test_lowercase_choices_stay_user_facing(self):
+        parsed = self.module.parser().parse_args(
+            ["analyze", "--url", "https://example.test/", "--strategy", "desktop", "--category", "best-practices"]
+        )
+        self.assertEqual("desktop", parsed.strategy)
+        self.assertEqual(["best-practices"], parsed.category)
+        args = SimpleNamespace(
+            profile="example", url="https://example.test/", strategy="desktop",
+            category=["best-practices"], audit_limit=10, json=True,
+        )
+        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+            self.module, "request_json",
+            return_value=lighthouse(categories={"best-practices": {"score": 0.5, "auditRefs": []}}),
+        ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
+            self.module.cmd_analyze(args)
+        row = json.loads(output.getvalue())[0]
+        self.assertEqual("best-practices", row["category"])
+        self.assertEqual("desktop", row["strategy"])
+
+    def test_hostile_response_shapes_are_refused(self):
+        cases = (
+            ({"lighthouseResult": None}, "malformed Lighthouse result"),
+            ({"lighthouseResult": []}, "malformed Lighthouse result"),
+            ({"lighthouseResult": "x"}, "malformed Lighthouse result"),
+            ({}, "no Lighthouse result"),
+            ({"lighthouseResult": {"categories": None}}, "malformed Lighthouse categories object"),
+            ({"lighthouseResult": {"categories": []}}, "malformed Lighthouse categories object"),
+            ({"lighthouseResult": {"audits": None}}, "malformed Lighthouse audits object"),
+            ({"lighthouseResult": {"audits": []}}, "malformed Lighthouse audits object"),
+            (lighthouse(categories={"performance": None}), "malformed performance category object"),
+            (lighthouse(categories={"performance": "x"}), "malformed performance category object"),
+            (lighthouse(categories={"performance": {"auditRefs": None}}), "malformed performance audit reference collection"),
+            (lighthouse(categories={"performance": {"auditRefs": "x"}}), "malformed performance audit reference collection"),
+            (lighthouse(categories={"performance": {"auditRefs": ["x"]}}), "malformed performance audit reference"),
+            (lighthouse(categories={"performance": {"auditRefs": [None]}}), "malformed performance audit reference"),
+            (lighthouse(categories={"performance": {"auditRefs": [{"id": 7, "weight": 1}]}}), "malformed performance audit reference id"),
+            (lighthouse(categories={"performance": {"auditRefs": [{"id": "a", "weight": "heavy"}]}}), "malformed performance audit reference weight"),
+            (lighthouse(audits={"a": None}), "malformed a audit object"),
+            (lighthouse(audits={"a": "x"}), "malformed a audit object"),
+            (lighthouse(audits={"a": {"score": "low"}}), "malformed a audit score"),
+            (lighthouse(audits={"a": {"score": 0.1, "title": 7}}), "malformed a audit title"),
+            (lighthouse(audits={"largest-contentful-paint": {"numericValue": "fast"}}), "malformed largest-contentful-paint audit numeric value"),
+            (lighthouse(categories={"performance": {"score": "great"}}), "malformed performance category score"),
+            (lighthouse(requestedUrl=7), "malformed requested URL"),
+            (lighthouse(finalUrl=[]), "malformed final URL"),
+            (lighthouse(fetchTime=7), "malformed fetch time"),
+            (lighthouse(lighthouseVersion={}), "malformed Lighthouse version"),
+        )
+        for payload, expected in cases:
+            with self.subTest(expected=expected, payload=payload):
+                args = SimpleNamespace(
+                    profile="example", url="https://example.test/", strategy="mobile",
+                    category=["performance"], audit_limit=10, json=True,
+                )
+                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                    self.module, "request_json", return_value=payload
+                ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaisesRegex(self.module.PageSpeedError, expected):
+                        self.module.cmd_analyze(args)
+
+    def test_non_finite_values_are_refused_before_rounding_or_emission(self):
+        cases = (
+            (lighthouse(categories={"performance": {"score": NAN}}), "non-finite performance category score"),
+            (lighthouse(categories={"performance": {"score": INFINITY}}), "non-finite performance category score"),
+            (lighthouse(categories={"performance": {"score": -INFINITY}}), "non-finite performance category score"),
+            (lighthouse(audits={"a": {"score": NAN}}), "non-finite a audit score"),
+            (lighthouse(audits={"a": {"score": -INFINITY}}), "non-finite a audit score"),
+            (lighthouse(categories={"performance": {"auditRefs": [{"id": "a", "weight": NAN}]}}), "non-finite performance audit reference weight"),
+            (lighthouse(categories={"performance": {"auditRefs": [{"id": "a", "weight": INFINITY}]}}), "non-finite performance audit reference weight"),
+            (lighthouse(audits={"largest-contentful-paint": {"numericValue": NAN}}), "non-finite largest-contentful-paint audit numeric value"),
+            (lighthouse(audits={"largest-contentful-paint": {"numericValue": INFINITY}}), "non-finite largest-contentful-paint audit numeric value"),
+        )
+        for payload, expected in cases:
+            with self.subTest(expected=expected):
+                args = SimpleNamespace(
+                    profile="example", url="https://example.test/", strategy="mobile",
+                    category=["performance"], audit_limit=10, json=True,
+                )
+                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                    self.module, "request_json", return_value=payload
+                ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaisesRegex(self.module.PageSpeedError, expected):
+                        self.module.cmd_analyze(args)
+
+    def test_non_finite_json_literals_are_refused_at_parse_time(self):
+        for body in (b'{"lighthouseResult": {"categories": {"performance": {"score": NaN}}}}',
+                     b'{"lighthouseResult": {"categories": {"performance": {"score": Infinity}}}}',
+                     b'{"lighthouseResult": {"categories": {"performance": {"score": -Infinity}}}}'):
+            with self.subTest(body=body):
+                with self.assertRaisesRegex(self.module.PageSpeedError, "non-finite JSON value"):
+                    self.module.request_json([("key", "secret-key")], opener=lambda *a, **k: RawResponse(body))
+
+    def test_json_output_is_standards_safe(self):
+        with self.assertRaisesRegex(self.module.PageSpeedError, "non-finite value as JSON"):
+            with redirect_stdout(io.StringIO()):
+                self.module.write_rows([{"score": NAN}], ["score"], True)
+        args = SimpleNamespace(
+            profile="example", url="https://example.test/", strategy="mobile",
+            category=["performance"], audit_limit=10, json=True,
+        )
+        payload = lighthouse(
+            categories={"performance": {"score": 0.5, "auditRefs": [{"id": "a", "weight": 3}]}},
+            audits={"a": {"score": 0.25, "title": "Fix a"},
+                    "largest-contentful-paint": {"numericValue": 2400.5, "displayValue": "2.4 s"}},
+        )
+        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+            self.module, "request_json", return_value=payload
+        ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
+            self.module.cmd_analyze(args)
+        emitted = output.getvalue()
+        self.assertNotIn("NaN", emitted)
+        self.assertNotIn("Infinity", emitted)
+        for row in json.loads(emitted):
+            for value in row.values():
+                if isinstance(value, float):
+                    self.assertTrue(math.isfinite(value))
+
+    def test_malformed_response_exits_two_without_a_traceback(self):
+        for payload in (lighthouse(categories={"performance": {"auditRefs": None}}),
+                        lighthouse(categories={"performance": {"score": NAN}}),
+                        {"lighthouseResult": None}):
+            with self.subTest(payload=payload):
+                with patch.dict(os.environ, self.env, clear=True), patch.object(
+                    self.module, "request_json", return_value=payload
+                ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
+                    code = self.module.main(["analyze", "--profile", "example", "--url", "https://example.test/"])
+                self.assertEqual(2, code)
+                self.assertTrue(error.getvalue().startswith("ERROR: "), error.getvalue())
+                self.assertNotIn("Traceback", error.getvalue())
+
+    def test_request_json_resolves_the_opener_at_call_time_without_touching_the_network(self):
+        def refuse(*args, **kwargs):
+            raise AssertionError("a real network connection was attempted")
+
+        calls = []
+
+        def fake_open_url(request, timeout=60):
+            calls.append(request)
+            return Response({"lighthouseResult": {"categories": {}, "audits": {}}})
+
+        with patch.object(socket.socket, "connect", refuse), patch.object(
+            socket, "create_connection", refuse
+        ), patch.object(socket, "getaddrinfo", refuse), patch.object(
+            self.module, "open_url", fake_open_url
+        ):
+            # No opener argument: a def-time default would bypass the patch and hit the guards above.
+            result = self.module.request_json([("url", "https://example.test/"), ("key", "secret-key")])
+        self.assertEqual({"lighthouseResult": {"categories": {}, "audits": {}}}, result)
+        self.assertEqual(1, len(calls))
+        self.assertIn("key=secret-key", calls[0].full_url)
 
     def test_launcher_help_is_credential_free_and_resolves_outside_repo(self):
         result = subprocess.run([str(LAUNCHER), "--help"], cwd="/tmp", env={"PATH": os.environ.get("PATH", "")}, text=True, capture_output=True, check=False)

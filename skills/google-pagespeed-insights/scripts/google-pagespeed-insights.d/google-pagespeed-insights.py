@@ -7,6 +7,7 @@ import argparse
 import csv
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -23,6 +24,15 @@ API_KEY = f"{SKILL}_API_KEY"
 LABEL = f"{SKILL}_LABEL"
 API_URL = "https://pagespeedonline.googleapis.com/pagespeedonline/v5/runPagespeed"
 PROFILE_RE = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)*")
+# The CLI keeps Google's lowercase Lighthouse identifiers, which are also the response keys, while
+# the query string must carry the uppercase enums from the v5 discovery document.
+STRATEGIES = {"mobile": "MOBILE", "desktop": "DESKTOP"}
+CATEGORIES = {
+    "performance": "PERFORMANCE",
+    "accessibility": "ACCESSIBILITY",
+    "best-practices": "BEST_PRACTICES",
+    "seo": "SEO",
+}
 METRICS = {
     "first-contentful-paint": "first_contentful_paint",
     "largest-contentful-paint": "largest_contentful_paint",
@@ -154,7 +164,51 @@ def open_url(request: urllib.request.Request, timeout: int = 60):
     return urllib.request.build_opener(RejectRedirectHandler()).open(request, timeout=timeout)
 
 
-def request_json(params: list[tuple[str, str]], opener: Callable[..., Any] = open_url) -> dict[str, Any]:
+def expect_object(value: Any, noun: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise PageSpeedError(f"Google returned a malformed {noun}.")
+    return value
+
+
+def expect_list(container: dict[str, Any], key: str, noun: str) -> list[Any]:
+    value = container.get(key, [])
+    if not isinstance(value, list):
+        raise PageSpeedError(f"Google returned a malformed {noun} collection.")
+    return value
+
+
+def expect_objects(container: dict[str, Any], key: str, noun: str) -> list[dict[str, Any]]:
+    return [expect_object(item, noun) for item in expect_list(container, key, noun)]
+
+
+def expect_text(container: dict[str, Any], key: str, noun: str) -> str:
+    value = container.get(key, "")
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise PageSpeedError(f"Google returned a malformed {noun}.")
+    return value
+
+
+def optional_number(container: dict[str, Any], key: str, noun: str) -> int | float | None:
+    """Absent stays absent; anything kept must survive rounding, sorting, and RFC 8259 emission."""
+    value = container.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PageSpeedError(f"Google returned a malformed {noun}.")
+    if not math.isfinite(value):
+        raise PageSpeedError(f"Google returned a non-finite {noun}.")
+    return value
+
+
+def refuse_non_finite(token: str) -> float:
+    raise PageSpeedError(f"Google returned the non-finite JSON value {token}.")
+
+
+def request_json(params: list[tuple[str, str]], opener: Callable[..., Any] | None = None) -> dict[str, Any]:
+    # Resolving the opener per call keeps open_url patchable; a default bound it at import time.
+    opener = opener or open_url
     request = urllib.request.Request(API_URL + "?" + urllib.parse.urlencode(params), method="GET")
     api_key = next((value for name, value in params if name == "key"), "")
     try:
@@ -171,18 +225,23 @@ def request_json(params: list[tuple[str, str]], opener: Callable[..., Any] = ope
         raise PageSpeedError(f"Google API request failed with HTTP {exc.code}" + (f": {message}" if message else ".")) from exc
     except urllib.error.URLError as exc:
         raise PageSpeedError(f"Google API request failed: {exc.reason}") from exc
+    if not payload:
+        return {}
     try:
-        result = json.loads(payload) if payload else {}
+        # json.loads accepts the NaN and Infinity literals by default; PageSpeed output cannot.
+        result = json.loads(payload, parse_constant=refuse_non_finite)
     except ValueError as exc:
         raise PageSpeedError("Google API returned invalid JSON.") from exc
-    if not isinstance(result, dict):
-        raise PageSpeedError("Google API returned an unexpected response.")
-    return result
+    return expect_object(result, "API response")
 
 
 def write_rows(rows: list[dict[str, Any]], columns: list[str], as_json: bool) -> None:
     if as_json:
-        print(json.dumps(rows, indent=2, sort_keys=True))
+        try:
+            # allow_nan=False refuses to emit NaN or Infinity, which are not valid JSON.
+            print(json.dumps(rows, indent=2, sort_keys=True, allow_nan=False))
+        except ValueError as exc:
+            raise PageSpeedError("Refused to emit a non-finite value as JSON.") from exc
         return
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
@@ -210,48 +269,53 @@ def valid_url(value: str) -> str:
 def cmd_analyze(args: argparse.Namespace) -> None:
     profile = selected_profile(args)
     categories = args.category or ["performance"]
-    params = [("url", args.url), ("strategy", args.strategy)]
-    params.extend(("category", category) for category in categories)
+    params = [("url", args.url), ("strategy", STRATEGIES[args.strategy])]
+    params.extend(("category", CATEGORIES[category]) for category in categories)
     params.append(("key", profile.api_key))
     response = request_json(params)
-    lighthouse = response.get("lighthouseResult")
-    if not isinstance(lighthouse, dict) or not lighthouse:
+    lighthouse = expect_object(response.get("lighthouseResult", {}), "Lighthouse result")
+    if not lighthouse:
         raise PageSpeedError("Google returned no Lighthouse result for the requested URL.")
-    returned_categories = lighthouse.get("categories", {})
-    audits = lighthouse.get("audits", {})
-    if not isinstance(returned_categories, dict) or not isinstance(audits, dict):
-        raise PageSpeedError("Google returned an incomplete Lighthouse result.")
+    returned_categories = expect_object(lighthouse.get("categories", {}), "Lighthouse categories object")
+    audits = expect_object(lighthouse.get("audits", {}), "Lighthouse audits object")
     common = {
-        "requested_url": lighthouse.get("requestedUrl", args.url),
-        "final_url": lighthouse.get("finalUrl", ""),
+        "requested_url": expect_text(lighthouse, "requestedUrl", "requested URL") or args.url,
+        "final_url": expect_text(lighthouse, "finalUrl", "final URL"),
         "strategy": args.strategy,
-        "fetch_time": lighthouse.get("fetchTime", ""),
-        "lighthouse_version": lighthouse.get("lighthouseVersion", ""),
+        "fetch_time": expect_text(lighthouse, "fetchTime", "fetch time"),
+        "lighthouse_version": expect_text(lighthouse, "lighthouseVersion", "Lighthouse version"),
         "profile": profile.name,
     }
     summaries = []
     for category in categories:
-        result = returned_categories.get(category, {})
-        if isinstance(result, dict):
-            score = result.get("score")
-            summaries.append({**common, "row_type": "summary", "category": category, "score": round(score * 100) if isinstance(score, (int, float)) else ""})
+        result = expect_object(returned_categories.get(category, {}), f"{category} category object")
+        score = optional_number(result, "score", f"{category} category score")
+        summaries.append({**common, "row_type": "summary", "category": category, "score": "" if score is None else round(score * 100)})
     metrics = []
     for audit_id, metric_name in METRICS.items():
-        result = audits.get(audit_id, {})
-        if isinstance(result, dict) and (result.get("displayValue") or result.get("numericValue") is not None):
-            metrics.append({**common, "row_type": "metric", "metric": metric_name, "value": result.get("displayValue", result.get("numericValue", "")), "numeric_value": result.get("numericValue", "")})
-    weighted: dict[str, float] = {}
-    for category in returned_categories.values():
-        if not isinstance(category, dict):
-            continue
-        for ref in category.get("auditRefs", []):
-            if isinstance(ref, dict) and isinstance(ref.get("weight"), (int, float)):
-                weighted[ref.get("id", "")] = max(weighted.get(ref.get("id", ""), 0), ref["weight"])
+        result = expect_object(audits.get(audit_id, {}), f"{audit_id} audit object")
+        display = expect_text(result, "displayValue", f"{audit_id} audit display value")
+        numeric = optional_number(result, "numericValue", f"{audit_id} audit numeric value")
+        if display or numeric is not None:
+            metrics.append({**common, "row_type": "metric", "metric": metric_name, "value": display or numeric, "numeric_value": "" if numeric is None else numeric})
+    # Every returned category contributes weights, not only the requested ones, so an audit keeps
+    # the highest weight any category assigns it.
+    weighted: dict[str, int | float] = {}
+    for name, returned in returned_categories.items():
+        category_object = expect_object(returned, f"{name} category object")
+        for ref in expect_objects(category_object, "auditRefs", f"{name} audit reference"):
+            weight = optional_number(ref, "weight", f"{name} audit reference weight")
+            if weight is None:
+                continue
+            ref_id = expect_text(ref, "id", f"{name} audit reference id")
+            weighted[ref_id] = max(weighted.get(ref_id, 0), weight)
     findings = []
     for audit_id, result in audits.items():
-        if not isinstance(result, dict) or not isinstance(result.get("score"), (int, float)) or result["score"] >= 1:
+        result = expect_object(result, f"{audit_id} audit object")
+        score = optional_number(result, "score", f"{audit_id} audit score")
+        if score is None or score >= 1:
             continue
-        findings.append({**common, "row_type": "audit", "audit": audit_id, "title": result.get("title", ""), "score": round(result["score"] * 100), "display_value": result.get("displayValue", ""), "weight": weighted.get(audit_id, 0)})
+        findings.append({**common, "row_type": "audit", "audit": audit_id, "title": expect_text(result, "title", f"{audit_id} audit title"), "score": round(score * 100), "display_value": expect_text(result, "displayValue", f"{audit_id} audit display value"), "weight": weighted.get(audit_id, 0)})
     findings.sort(key=lambda item: (-item["weight"], item["score"], item["audit"]))
     if len(findings) > args.audit_limit:
         print(f"WARNING: audit output truncated to {args.audit_limit} findings.", file=sys.stderr)
@@ -272,8 +336,8 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=cmd_profiles)
     command = subs.add_parser("analyze", parents=[parent, profile], help="Run a Lighthouse assessment for one public webpage.")
     command.add_argument("--url", required=True, type=valid_url)
-    command.add_argument("--strategy", choices=["mobile", "desktop"], default="mobile")
-    command.add_argument("--category", action="append", choices=["performance", "accessibility", "best-practices", "seo"])
+    command.add_argument("--strategy", choices=list(STRATEGIES), default="mobile")
+    command.add_argument("--category", action="append", choices=list(CATEGORIES))
     command.add_argument("--audit-limit", type=int, default=10)
     command.set_defaults(func=cmd_analyze)
     return result
