@@ -1,0 +1,7 @@
+{
+  "needs": {
+    "GOOGLE_ANALYTICS_CLIENT_ID": "the OAuth 2.0 client ID for a Google Cloud project with the Google Analytics Data and Admin APIs enabled",
+    "GOOGLE_ANALYTICS_CLIENT_SECRET": "the OAuth 2.0 client secret paired with GOOGLE_ANALYTICS_CLIENT_ID",
+    "GOOGLE_ANALYTICS_REFRESH_TOKEN": "an OAuth refresh token granted the https://www.googleapis.com/auth/analytics.readonly scope"
+  }
+}

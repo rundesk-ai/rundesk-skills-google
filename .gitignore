@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Operating systems
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.directory
+.Trash-*
