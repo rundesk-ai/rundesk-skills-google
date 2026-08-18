@@ -37,9 +37,11 @@
 
 - [ ] The diff contains no credential, OAuth grant, customer identifier, private-project language, owner-specific path, or unrelated artifact.
 - [ ] Reads remain bounded by default and report truncation explicitly.
+- [ ] Every mutation remains a preview until the owner approves the exact target and effect and supplies the package's exact confirmation input.
 - [ ] JSON remains opt-in; default text output and compatibility impact are documented.
 - [ ] No package imports, executes, or depends on a sibling package.
 - [ ] Runtime code remains Python 3.9+ and standard-library only, unless the owner approved a dependency.
+- [ ] Tests remain offline and replace OAuth and Google API boundaries with synthetic fixtures.
 - [ ] Credential-free help, offline profiles, secret redaction, and unambiguous resource selection remain intact.
 - [ ] `README.md`, `manifest.json`, and `skills/` agree.
 - [ ] Any required semantic `manifest.json` version change follows `RELEASING.md` and is stated below.
@@ -57,3 +59,9 @@
 ```text
 
 ```
+
+## Agent
+
+<!-- Replace the placeholder with the filing agent's display name. Do not add provider, model, tool, session, or generated-by branding. -->
+
+🤖 by <Agent>
