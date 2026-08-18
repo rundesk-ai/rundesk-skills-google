@@ -14,6 +14,7 @@ rundesk skills install https://github.com/rundesk-ai/rundesk-skills-google
 rundesk skills install https://github.com/rundesk-ai/rundesk-skills-google --confirm
 rundesk skills grant <agent> rundesk-skills-google/google-search-console
 rundesk skills grant <agent> rundesk-skills-google/google-analytics
+rundesk skills grant <agent> rundesk-skills-google/google-pagespeed-insights
 ```
 
 Installation previews until `--confirm`, installs every package, and grants none automatically.
@@ -57,5 +58,7 @@ in their owning package instead of turning the lexicon into a field inventory.
   inspection.
 - `google-analytics` — accessible GA4 accounts and properties plus bounded Analytics Data API
   reports.
+- `google-pagespeed-insights` — bounded Lighthouse scores, lab metrics, and prioritized audit
+  findings for public webpages.
 
 Maintainers use [RELEASING.md](RELEASING.md).

@@ -60,3 +60,21 @@ not call it a `site`; one property can receive data from several web or app stre
 A bounded result from the Google Analytics Data API. Use `report` for historical data and
 `realtime` for the Realtime API. Preserve Google-defined metric and dimension names verbatim at the
 API boundary.
+
+## PageSpeed Insights
+
+### Analysis
+
+A point-in-time Lighthouse assessment returned by the PageSpeed Insights API for one public URL.
+Use `analyze` for the command and `analysis` for the result. Do not call it a report, which is the
+established Google Analytics concept.
+
+### Strategy
+
+The PageSpeed Insights device-emulation choice. Preserve Google's `mobile` and `desktop` values.
+Do not call this a device because it does not identify a physical device.
+
+### Audit
+
+One Lighthouse diagnostic or opportunity within an analysis. Use `audit` for the individual result
+and `category` for Google's performance, accessibility, best-practices, and SEO groupings.
