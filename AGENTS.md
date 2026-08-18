@@ -10,10 +10,8 @@ catalog, `ENVIRONMENTS.md` defines credentials and state, and `RELEASING.md` def
 ## Before you work
 
 1. Read `README.md`, `ENVIRONMENTS.md`, and every `SKILL.md` you will touch.
-2. Load the governing skill for the artifact. Use `writing-skills` for `SKILL.md`,
-   `python-patterns` for Python and tests, and `managing-github` for pull requests or releases.
-   Follow the integration CLI guide for an integration package; it is repository guidance, not a
-   runtime skill. If a named skill is unavailable, report that fact.
+2. Review the skills supplied by the runtime and load every one that applies to the artifact. Use
+   `writing-skills` for `SKILL.md` and `managing-github` for pull requests or releases.
 3. Confirm an existing package does not already own the Google API before adding another.
 4. Inspect the current Google API contract and the package's existing conventions before naming a
    resource, command, scope, or environment variable.
