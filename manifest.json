@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "rundesk-skills-google",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "Guarded Google Search Console, Google Analytics, and PageSpeed Insights integrations.",
   "skills": [
     {"name": "google-search-console", "path": "skills/google-search-console"},
