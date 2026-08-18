@@ -64,6 +64,99 @@ def lighthouse(categories=None, audits=None, **extra):
     return {"lighthouseResult": result}
 
 
+LEGACY_COLUMNS = ("row_type,category,metric,audit,title,score,value,numeric_value,display_value,"
+                  "weight,requested_url,final_url,strategy,fetch_time,lighthouse_version,profile")
+
+
+def field_experience(**overrides):
+    """A CrUX scope shaped like the documented response: percentile, category, and open-ended tail."""
+    experience = {
+        "id": "https://www.example.test/",
+        "metrics": {
+            # Deliberately not in the documented order, so row order proves it is imposed here.
+            "INTERACTION_TO_NEXT_PAINT": {"percentile": 180, "category": "FAST", "distributions": [
+                {"min": 0, "max": 200, "proportion": 0.88},
+                {"min": 200, "max": 500, "proportion": 0.09},
+                {"min": 500, "proportion": 0.03},
+            ]},
+            # A raw CrUX integer, not a Lighthouse CLS ratio.
+            "CUMULATIVE_LAYOUT_SHIFT_SCORE": {"percentile": 10, "category": "FAST", "distributions": []},
+            "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2400, "category": "AVERAGE", "distributions": [
+                {"min": 0, "max": 2500, "proportion": 0.7231},
+                {"min": 2500, "max": 4000, "proportion": 0.19},
+                {"min": 4000, "proportion": 0.0869},
+            ]},
+        },
+        "overall_category": "AVERAGE",
+        "origin_fallback": False,
+    }
+    experience.update(overrides)
+    return experience
+
+
+def with_field_data(url=None, origin=None, **lighthouse_extra):
+    payload = lighthouse(
+        categories={"performance": {"score": 0.5, "auditRefs": []}},
+        audits={}, **lighthouse_extra,
+    )
+    if url is not None:
+        payload["loadingExperience"] = url
+    if origin is not None:
+        payload["originLoadingExperience"] = origin
+    return payload
+
+
+def analyze_args(**overrides):
+    # field_data mirrors the real default so a test must opt in exactly as a caller would.
+    defaults = dict(profile="example", url="https://example.test/", strategy="mobile",
+                    category=["performance"], audit_limit=10, json=True, field_data="none")
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+GOLDEN_PAYLOAD = {
+    "loadingExperience": {
+        "id": "https://www.example.test/",
+        "metrics": {"LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2400, "category": "AVERAGE",
+                                                    "distributions": [
+                                                        {"min": 0, "max": 2500, "proportion": 0.7231},
+                                                        {"min": 2500, "max": 4000, "proportion": 0.19},
+                                                        {"min": 4000, "proportion": 0.0869}]}},
+        "overall_category": "AVERAGE", "origin_fallback": False},
+    "originLoadingExperience": {
+        "id": "https://www.example.test",
+        "metrics": {"CUMULATIVE_LAYOUT_SHIFT_SCORE": {"percentile": 10, "category": "AVERAGE"}},
+        "overall_category": "SLOW"},
+    "lighthouseResult": {
+        "requestedUrl": "https://example.test/", "finalUrl": "https://www.example.test/",
+        "fetchTime": "2026-08-18T12:00:00Z", "lighthouseVersion": "13.0.0",
+        "categories": {"performance": {"score": 0.82, "auditRefs": [
+            {"id": "render-blocking-resources", "weight": 5}]}},
+        "audits": {"largest-contentful-paint": {"numericValue": 2600, "displayValue": "2.6 s"},
+                   "render-blocking-resources": {"score": 0.2,
+                                                 "title": "Eliminate render-blocking resources"}}},
+}
+CONTEXT = ("https://example.test/,https://www.example.test/,mobile,2026-08-18T12:00:00Z,13.0.0,"
+           "example")
+# The exact bytes a caller written before field data existed received for GOLDEN_PAYLOAD.
+GOLDEN_CSV = "\n".join((
+    LEGACY_COLUMNS,
+    f"summary,performance,,,,82,,,,,{CONTEXT}",
+    f"metric,,largest_contentful_paint,,,,2.6 s,2600,,,{CONTEXT}",
+    f"audit,,,render-blocking-resources,Eliminate render-blocking resources,20,,,,5,{CONTEXT}",
+)) + "\n"
+GOLDEN_CONTEXT = {"requested_url": "https://example.test/", "final_url": "https://www.example.test/",
+                  "strategy": "mobile", "fetch_time": "2026-08-18T12:00:00Z",
+                  "lighthouse_version": "13.0.0", "profile": "example"}
+GOLDEN_JSON = [
+    {**GOLDEN_CONTEXT, "row_type": "summary", "category": "performance", "score": 82},
+    {**GOLDEN_CONTEXT, "row_type": "metric", "metric": "largest_contentful_paint",
+     "value": "2.6 s", "numeric_value": 2600},
+    {**GOLDEN_CONTEXT, "row_type": "audit", "audit": "render-blocking-resources",
+     "title": "Eliminate render-blocking resources", "score": 20, "display_value": "", "weight": 5},
+]
+
+
 class PageSpeedTest(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
@@ -72,6 +165,37 @@ class PageSpeedTest(unittest.TestCase):
             "GOOGLE_PAGESPEED_INSIGHTS_LABEL__EXAMPLE": "Example PageSpeed",
         }
         self.profile = self.module.Profile("example", "secret-key", "Example PageSpeed")
+
+    def analyze(self, payload, **overrides):
+        args = analyze_args(**overrides)
+        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+            self.module, "request_json", return_value=payload
+        ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+            self.module.cmd_analyze(args)
+        return output.getvalue(), error.getvalue()
+
+    def field_of(self, payload, **overrides):
+        emitted, error = self.analyze(payload, **overrides)
+        rows = json.loads(emitted)
+        return [row for row in rows if row["row_type"].startswith("field_")], error
+
+    def run_main(self, argv, payload):
+        """Drive the real entry point so exit status and staged output are what a caller sees."""
+        with patch.dict(os.environ, self.env, clear=True), patch.object(
+            self.module, "request_json", return_value=payload
+        ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+            code = self.module.main(argv)
+        return code, output.getvalue(), error.getvalue()
+
+    def assertFieldRefused(self, extra, expected):
+        payload = with_field_data()
+        payload.update(extra)
+        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+            self.module, "request_json", return_value=payload
+        ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(self.module.PageSpeedError, expected):
+                self.module.cmd_analyze(analyze_args(field_data="distributions"))
+        self.assertEqual("", output.getvalue())
 
     def test_profiles_discovers_named_profile_without_network(self):
         with patch.dict(os.environ, self.env, clear=True), patch.object(
@@ -115,7 +239,7 @@ class PageSpeedTest(unittest.TestCase):
         self.assertNotIn("secret-key", str(raised.exception))
 
     def test_analyze_normalizes_scores_metrics_and_bounded_audits(self):
-        args = SimpleNamespace(profile="example", url="https://example.test/", strategy="mobile", category=["performance", "seo"], audit_limit=1, json=True)
+        args = SimpleNamespace(profile="example", url="https://example.test/", strategy="mobile", category=["performance", "seo"], audit_limit=1, json=True, field_data="none")
         payload = {"lighthouseResult": {
             "requestedUrl": args.url, "finalUrl": "https://www.example.test/", "fetchTime": "2026-08-17T12:00:00Z", "lighthouseVersion": "13.0.0",
             "categories": {
@@ -145,7 +269,7 @@ class PageSpeedTest(unittest.TestCase):
         self.assertNotIn("secret-key", output.getvalue() + error.getvalue())
 
     def test_empty_lighthouse_result_is_refused(self):
-        args = SimpleNamespace(profile="example", url="https://example.test/", strategy="mobile", category=None, audit_limit=10, json=True)
+        args = SimpleNamespace(profile="example", url="https://example.test/", strategy="mobile", category=None, audit_limit=10, json=True, field_data="none")
         with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(self.module, "request_json", return_value={}):
             with self.assertRaisesRegex(self.module.PageSpeedError, "no Lighthouse result"):
                 self.module.cmd_analyze(args)
@@ -177,6 +301,7 @@ class PageSpeedTest(unittest.TestCase):
                 args = SimpleNamespace(
                     profile="example", url="https://example.test/", strategy=strategy,
                     category=list(self.module.CATEGORIES), audit_limit=10, json=True,
+                    field_data="summary",
                 )
                 with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
                     self.module, "request_json", return_value=lighthouse()
@@ -198,7 +323,7 @@ class PageSpeedTest(unittest.TestCase):
         self.assertEqual(["best-practices"], parsed.category)
         args = SimpleNamespace(
             profile="example", url="https://example.test/", strategy="desktop",
-            category=["best-practices"], audit_limit=10, json=True,
+            category=["best-practices"], audit_limit=10, json=True, field_data="none",
         )
         with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
             self.module, "request_json",
@@ -245,7 +370,7 @@ class PageSpeedTest(unittest.TestCase):
             with self.subTest(expected=expected, payload=payload):
                 args = SimpleNamespace(
                     profile="example", url="https://example.test/", strategy="mobile",
-                    category=["performance"], audit_limit=10, json=True,
+                    category=["performance"], audit_limit=10, json=True, field_data="none",
                 )
                 with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
                     self.module, "request_json", return_value=payload
@@ -284,7 +409,7 @@ class PageSpeedTest(unittest.TestCase):
             with self.subTest(expected=expected):
                 args = SimpleNamespace(
                     profile="example", url="https://example.test/", strategy="mobile",
-                    category=["performance"], audit_limit=10, json=True,
+                    category=["performance"], audit_limit=10, json=True, field_data="none",
                 )
                 with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
                     self.module, "request_json", return_value=payload
@@ -306,7 +431,7 @@ class PageSpeedTest(unittest.TestCase):
                 self.module.write_rows([{"score": NAN}], ["score"], True)
         args = SimpleNamespace(
             profile="example", url="https://example.test/", strategy="mobile",
-            category=["performance"], audit_limit=10, json=True,
+            category=["performance"], audit_limit=10, json=True, field_data="none",
         )
         payload = lighthouse(
             categories={"performance": {"score": 0.5, "auditRefs": [{"id": "a", "weight": 3}]}},
@@ -358,6 +483,432 @@ class PageSpeedTest(unittest.TestCase):
         self.assertEqual({"lighthouseResult": {"categories": {}, "audits": {}}}, result)
         self.assertEqual(1, len(calls))
         self.assertIn("key=secret-key", calls[0].full_url)
+
+    def test_default_invocation_emits_byte_for_byte_legacy_csv(self):
+        # A caller written before field data existed must see exactly the output it saw then, even
+        # though this response carries field data.
+        code, emitted, error = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/"], GOLDEN_PAYLOAD)
+        self.assertEqual(0, code)
+        self.assertEqual(GOLDEN_CSV, emitted)
+        self.assertEqual("", error)
+
+    def test_default_invocation_emits_the_legacy_json_row_set(self):
+        code, emitted, error = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/", "--json"],
+            GOLDEN_PAYLOAD)
+        self.assertEqual(0, code)
+        self.assertEqual(GOLDEN_JSON, json.loads(emitted))
+        self.assertEqual("", error)
+        emitted_keys = {key for row in json.loads(emitted) for key in row}
+        self.assertEqual(set(), emitted_keys & set(self.module.FIELD_COLUMNS))
+        self.assertEqual(set(), emitted_keys & set(self.module.DISTRIBUTION_COLUMNS))
+
+    def test_field_data_defaults_to_none_without_changing_the_request(self):
+        parsed = self.module.parser().parse_args(["analyze", "--url", "https://example.test/"])
+        self.assertEqual("none", parsed.field_data)
+        args = analyze_args()
+        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+            self.module, "request_json", return_value=GOLDEN_PAYLOAD
+        ) as request, redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(0, self.module.cmd_analyze(args))
+        self.assertEqual([("url", "https://example.test/"), ("strategy", "MOBILE"),
+                          ("category", "PERFORMANCE"), ("key", "secret-key")],
+                         request.call_args.args[0])
+        self.assertNotIn("secret-key", output.getvalue() + error.getvalue())
+
+    def test_field_data_reports_page_and_origin_scopes_separately(self):
+        payload = with_field_data(
+            url=field_experience(),
+            origin=field_experience(
+                id="https://www.example.test",
+                metrics={"LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 3100, "category": "SLOW"}},
+                overall_category="SLOW",
+            ),
+        )
+        # An origin object carries no origin_fallback field; only a page request can fall back.
+        del payload["originLoadingExperience"]["origin_fallback"]
+        rows, error = self.field_of(payload, field_data="summary")
+        summaries = [row for row in rows if row["row_type"] == "field_summary"]
+        self.assertEqual([("url", "url"), ("origin", "origin")],
+                         [(row["requested_scope"], row["effective_scope"]) for row in summaries])
+        self.assertEqual(["https://www.example.test/", "https://www.example.test"],
+                         [row["field_id"] for row in summaries])
+        self.assertEqual(["AVERAGE", "SLOW"], [row["field_category"] for row in summaries])
+        self.assertEqual(["false", ""], [row["origin_fallback"] for row in summaries])
+        page = [row for row in rows
+                if row["row_type"] == "field_metric" and row["requested_scope"] == "url"]
+        self.assertEqual(["largest_contentful_paint", "cumulative_layout_shift_score_raw",
+                          "interaction_to_next_paint"], [row["metric"] for row in page])
+        self.assertEqual([2400, 10, 180], [row["percentile"] for row in page])
+        self.assertEqual(["AVERAGE", "FAST", "FAST"], [row["field_category"] for row in page])
+        self.assertEqual([], [row for row in rows if row["row_type"] == "field_distribution"])
+        self.assertNotIn("NOTE:", error)
+
+    def test_origin_fallback_is_reported_as_an_origin_effective_scope(self):
+        # https://developers.google.com/speed/docs/insights/v5/about: a page with too few samples is
+        # answered with origin-level experiences.
+        payload = with_field_data(url=field_experience(id="https://www.example.test",
+                                                       origin_fallback=True))
+        rows, _ = self.field_of(payload, field_data="distributions")
+        self.assertEqual({"url"}, {row["requested_scope"] for row in rows})
+        self.assertEqual({"origin"}, {row["effective_scope"] for row in rows})
+        self.assertEqual({"true"}, {row["origin_fallback"] for row in rows})
+        self.assertEqual({"field_summary", "field_metric", "field_distribution"},
+                         {row["row_type"] for row in rows})
+
+    def test_effective_scope_alone_cannot_classify_fallback_as_page_level(self):
+        payload = with_field_data(
+            url=field_experience(id="https://www.example.test", origin_fallback=True),
+            origin=field_experience(id="https://www.example.test", overall_category="SLOW"),
+        )
+        del payload["originLoadingExperience"]["origin_fallback"]
+        rows, _ = self.field_of(payload, field_data="summary")
+        # Reading effective_scope alone must never yield page-level data that is really site-wide.
+        self.assertEqual([], [row for row in rows if row["effective_scope"] == "url"])
+        self.assertEqual({"origin"}, {row["effective_scope"] for row in rows})
+        # requested_scope is what still separates the fallback from the genuine origin object.
+        self.assertEqual({"url", "origin"}, {row["requested_scope"] for row in rows})
+        fallback = [row for row in rows if row["requested_scope"] == "url"]
+        genuine = [row for row in rows if row["requested_scope"] == "origin"]
+        self.assertTrue(fallback and genuine)
+        self.assertEqual({"true"}, {row["origin_fallback"] for row in fallback})
+        self.assertEqual({""}, {row["origin_fallback"] for row in genuine})
+
+    def test_raw_metric_key_and_unit_travel_with_every_field_row(self):
+        payload = with_field_data(url=field_experience(metrics={
+            "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2400, "category": "AVERAGE",
+                                            "distributions": [{"min": 0, "max": 2500, "proportion": 1}]},
+            "CUMULATIVE_LAYOUT_SHIFT_SCORE": {"percentile": 25, "category": "SLOW"},
+            "EXPERIMENTAL_NEW_VITAL": {"percentile": 42, "category": "FAST"},
+        }))
+        rows, _ = self.field_of(payload, field_data="distributions")
+        measured = [row for row in rows if row["row_type"] != "field_summary"]
+        self.assertTrue(all(row["field_metric_key"] and row["unit"] for row in measured))
+        by_name = {row["metric"]: row for row in measured if row["row_type"] == "field_metric"}
+        self.assertEqual(("LARGEST_CONTENTFUL_PAINT_MS", "milliseconds"),
+                         (by_name["largest_contentful_paint"]["field_metric_key"],
+                          by_name["largest_contentful_paint"]["unit"]))
+        self.assertEqual(("EXPERIMENTAL_NEW_VITAL", "api_value"),
+                         (by_name["experimental_new_vital"]["field_metric_key"],
+                          by_name["experimental_new_vital"]["unit"]))
+        bucket = next(row for row in measured if row["row_type"] == "field_distribution")
+        self.assertEqual(("LARGEST_CONTENTFUL_PAINT_MS", "milliseconds"),
+                         (bucket["field_metric_key"], bucket["unit"]))
+
+    def test_cumulative_layout_shift_keeps_the_raw_integer_and_a_distinct_name(self):
+        payload = with_field_data(url=field_experience(metrics={
+            "CUMULATIVE_LAYOUT_SHIFT_SCORE": {"percentile": 25, "category": "SLOW", "distributions": [
+                {"min": 0, "max": 10, "proportion": 0.6},
+                {"min": 10, "max": 25, "proportion": 0.25},
+                {"min": 25, "proportion": 0.15},
+            ]}}))
+        rows, _ = self.field_of(payload, field_data="distributions")
+        metric = next(row for row in rows if row["row_type"] == "field_metric")
+        # The raw integer is preserved exactly: 25 is never rescaled to 0.25.
+        self.assertEqual(25, metric["percentile"])
+        self.assertEqual("cumulative_layout_shift_score_raw", metric["metric"])
+        self.assertEqual("CUMULATIVE_LAYOUT_SHIFT_SCORE", metric["field_metric_key"])
+        self.assertEqual("api_integer", metric["unit"])
+        # The name must not be the one a Lighthouse CLS row uses, or the two would be compared.
+        self.assertNotIn(metric["metric"], set(self.module.METRICS.values()))
+        self.assertNotEqual("cumulative_layout_shift", metric["metric"])
+        buckets = [row for row in rows if row["row_type"] == "field_distribution"]
+        self.assertEqual([(0, 10), (10, 25), (25, "")],
+                         [(row["bucket_min"], row["bucket_max"]) for row in buckets])
+        self.assertEqual({"api_integer"}, {row["unit"] for row in buckets})
+
+    def test_absent_field_values_are_never_reported_as_zero(self):
+        payload = with_field_data(url=field_experience(metrics={
+            # A real zero percentile survives; an unreported one stays visibly empty.
+            "CUMULATIVE_LAYOUT_SHIFT_SCORE": {"percentile": 0, "category": "FAST"},
+            "LARGEST_CONTENTFUL_PAINT_MS": {"category": "NONE"},
+            "INTERACTION_TO_NEXT_PAINT": {},
+        }))
+        rows, _ = self.field_of(payload, field_data="summary")
+        metrics = {row["metric"]: row for row in rows if row["row_type"] == "field_metric"}
+        self.assertEqual(0, metrics["cumulative_layout_shift_score_raw"]["percentile"])
+        self.assertEqual("", metrics["largest_contentful_paint"]["percentile"])
+        self.assertEqual("NONE", metrics["largest_contentful_paint"]["field_category"])
+        # A metric Google returned empty and a metric it never returned are both simply absent.
+        self.assertNotIn("interaction_to_next_paint", metrics)
+        self.assertNotIn("first_contentful_paint", metrics)
+
+    def test_partial_field_data_reports_only_the_object_google_returned(self):
+        # https://developers.google.com/speed/docs/insights/release_notes (2021-06-10): a page can
+        # have sufficient data for some metrics and not others.
+        payload = with_field_data(url=field_experience(
+            metrics={"LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2400, "category": "AVERAGE"}}))
+        rows, error = self.field_of(payload, field_data="summary")
+        self.assertEqual({"url"}, {row["requested_scope"] for row in rows})
+        self.assertEqual(["largest_contentful_paint"],
+                         [row["metric"] for row in rows if row["row_type"] == "field_metric"])
+        self.assertNotIn("NOTE:", error)
+
+    def test_distributions_report_raw_bucket_bounds_and_proportions(self):
+        rows, _ = self.field_of(with_field_data(url=field_experience()),
+                                field_data="distributions")
+        buckets = [row for row in rows if row["row_type"] == "field_distribution"
+                   and row["metric"] == "largest_contentful_paint"]
+        self.assertEqual(
+            [(0, 2500, 0.7231), (2500, 4000, 0.19), (4000, "", 0.0869)],
+            [(row["bucket_min"], row["bucket_max"], row["proportion"]) for row in buckets],
+        )
+        # A metric with no buckets keeps its percentile row and adds nothing else.
+        self.assertEqual([], [row for row in rows if row["row_type"] == "field_distribution"
+                              and row["metric"] == "cumulative_layout_shift_score_raw"])
+        self.assertIn("cumulative_layout_shift_score_raw",
+                      [row["metric"] for row in rows if row["row_type"] == "field_metric"])
+
+    def test_absent_or_empty_distributions_stay_acceptable(self):
+        for distributions in ({}, {"distributions": []}):
+            with self.subTest(distributions=distributions):
+                payload = with_field_data(url=field_experience(metrics={
+                    "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2400, "category": "AVERAGE",
+                                                    **distributions}}))
+                rows, _ = self.field_of(payload, field_data="distributions")
+                self.assertEqual(["largest_contentful_paint"],
+                                 [row["metric"] for row in rows if row["row_type"] == "field_metric"])
+                self.assertEqual([], [row for row in rows if row["row_type"] == "field_distribution"])
+
+    def test_rounded_distribution_proportions_stay_acceptable(self):
+        payload = with_field_data(url=field_experience(metrics={
+            "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2400, "category": "AVERAGE",
+                                            "distributions": [
+                                                {"min": 0, "max": 2500, "proportion": 0.72},
+                                                {"min": 2500, "max": 4000, "proportion": 0.19},
+                                                {"min": 4000, "proportion": 0.08}]}}))
+        rows, _ = self.field_of(payload, field_data="distributions")
+        self.assertEqual(3, len([row for row in rows if row["row_type"] == "field_distribution"]))
+
+    def test_unrecognized_field_metric_is_passed_through_lowercased(self):
+        # The v5 reference documents the metrics map key only as `(key)`, so a new metric must not
+        # disappear from the reading.
+        payload = with_field_data(url=field_experience(metrics={
+            "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2400, "category": "AVERAGE"},
+            "EXPERIMENTAL_NEW_VITAL": {"percentile": 42, "category": "FAST"},
+        }))
+        rows, _ = self.field_of(payload, field_data="summary")
+        self.assertEqual([("largest_contentful_paint", "LARGEST_CONTENTFUL_PAINT_MS"),
+                          ("experimental_new_vital", "EXPERIMENTAL_NEW_VITAL")],
+                         [(row["metric"], row["field_metric_key"]) for row in rows
+                          if row["row_type"] == "field_metric"])
+
+    def test_missing_field_data_is_noted_rather_than_silently_empty(self):
+        for payload in (with_field_data(),
+                        with_field_data(url=None, origin=None),
+                        {**with_field_data(), "loadingExperience": None,
+                         "originLoadingExperience": {}}):
+            with self.subTest(payload=payload):
+                rows, error = self.field_of(payload, field_data="summary")
+                self.assertEqual([], rows)
+                self.assertIn("no Chrome UX Report field data", error)
+
+    def test_text_output_carries_the_field_columns(self):
+        emitted, _ = self.analyze(with_field_data(url=field_experience()), json=False,
+                                  field_data="summary")
+        header = emitted.splitlines()[0].split(",")
+        self.assertEqual(["requested_scope", "effective_scope", "origin_fallback", "field_id",
+                          "field_metric_key", "unit", "percentile", "field_category"],
+                         header[header.index("requested_scope"):header.index("requested_scope") + 8])
+        self.assertNotIn("bucket_min", header)
+        self.assertIn("field_summary,,,,,,,,,,url,url,false,https://www.example.test/,,,,AVERAGE,",
+                      emitted)
+        self.assertIn("field_metric,,largest_contentful_paint,,,,,,,,url,url,false,"
+                      "https://www.example.test/,LARGEST_CONTENTFUL_PAINT_MS,milliseconds,2400,AVERAGE,",
+                      emitted)
+
+    def test_distribution_columns_appear_only_when_requested(self):
+        emitted, _ = self.analyze(with_field_data(url=field_experience()), json=False,
+                                  field_data="distributions")
+        self.assertEqual(["bucket_min", "bucket_max", "proportion"],
+                         emitted.splitlines()[0].split(",")[18:21])
+
+    def test_runtime_error_reports_requested_field_data_and_still_fails(self):
+        # Trace scenario 1: the lab half failed, the field half was asked for and is valid.
+        payload = with_field_data(url=field_experience(),
+                                  runtimeError={"code": "ERRORED_DOCUMENT_REQUEST",
+                                                "message": "Lighthouse was unable to load the page."})
+        code, emitted, error = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/",
+             "--field-data", "summary", "--json"], payload)
+        self.assertEqual(2, code)
+        rows = json.loads(emitted)
+        self.assertTrue(rows)
+        # Only field rows: no score, metric, or audit row may be invented from a failed run.
+        self.assertEqual({"field_summary", "field_metric"}, {row["row_type"] for row in rows})
+        self.assertIn("ERRORED_DOCUMENT_REQUEST", error)
+        self.assertIn("unable to load", error)
+        self.assertTrue(error.startswith("ERROR: "), error)
+        self.assertNotIn("Traceback", error)
+
+    def test_runtime_error_without_requested_field_data_emits_nothing(self):
+        # Trace scenario 2: field data was not asked for, so the fail-safe path is unchanged.
+        payload = with_field_data(url=field_experience(),
+                                  runtimeError={"code": "ERRORED_DOCUMENT_REQUEST", "message": "no load"})
+        code, emitted, error = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/"], payload)
+        self.assertEqual(2, code)
+        self.assertEqual("", emitted)
+        self.assertIn("ERRORED_DOCUMENT_REQUEST", error)
+
+    def test_runtime_error_with_no_field_data_available_emits_nothing(self):
+        # Trace scenario 3: asked for, but Google returned none, so there is nothing to report.
+        payload = with_field_data(runtimeError={"code": "ERRORED_DOCUMENT_REQUEST", "message": "no load"})
+        code, emitted, error = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/",
+             "--field-data", "summary"], payload)
+        self.assertEqual(2, code)
+        self.assertEqual("", emitted)
+        self.assertIn("ERRORED_DOCUMENT_REQUEST", error)
+        self.assertNotIn("Traceback", error)
+
+    def test_runtime_error_with_malformed_field_data_emits_nothing(self):
+        # Trace scenario 4: requested field data is validated even though Lighthouse also failed.
+        payload = with_field_data(url=field_experience(metrics={
+            "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": "fast"}}),
+            runtimeError={"code": "ERRORED_DOCUMENT_REQUEST", "message": "no load"})
+        code, emitted, error = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/",
+             "--field-data", "summary"], payload)
+        self.assertEqual(2, code)
+        self.assertEqual("", emitted)
+        self.assertIn("field metric percentile", error)
+        self.assertNotIn("Traceback", error)
+
+    def test_unknown_field_categories_are_refused(self):
+        cases = (
+            ({"loadingExperience": {"overall_category": "EXCELLENT"}},
+             "unknown url field overall category: EXCELLENT"),
+            ({"loadingExperience": {"metrics": {"LARGEST_CONTENTFUL_PAINT_MS": {"category": "GOOD"}}}},
+             "unknown url LARGEST_CONTENTFUL_PAINT_MS field metric category: GOOD"),
+        )
+        for extra, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertFieldRefused(extra, expected)
+        for category in self.module.FIELD_CATEGORIES:
+            with self.subTest(category=category):
+                payload = with_field_data(url=field_experience(
+                    overall_category=category,
+                    metrics={"LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 1, "category": category}}))
+                rows, _ = self.field_of(payload, field_data="summary")
+                self.assertEqual({category}, {row["field_category"] for row in rows})
+
+    def test_incomplete_or_inconsistent_distributions_are_refused(self):
+        def buckets(*items):
+            return {"loadingExperience": {"metrics": {
+                "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2400, "distributions": list(items)}}}}
+
+        cases = (
+            (buckets({"min": 0, "max": 2500}), "bucket without a proportion"),
+            (buckets({"min": 0, "max": 2500, "proportion": 1.5}), "proportion outside 0 to 1"),
+            (buckets({"min": 0, "max": 2500, "proportion": -0.1}), "proportion outside 0 to 1"),
+            (buckets({"min": 0, "max": 2500, "proportion": 0.4},
+                     {"min": 2500, "proportion": 0.2}), "proportions totalling"),
+            (buckets({"min": 0, "max": 2500, "proportion": 0.6},
+                     {"min": 2500, "proportion": 0.9}), "proportions totalling"),
+            (buckets({"max": 2500, "proportion": 1}), "bucket without a minimum"),
+            (buckets({"min": -1, "max": 2500, "proportion": 1}), "negative"),
+            (buckets({"min": 0, "max": -5, "proportion": 1}), "negative"),
+            (buckets({"min": 2500, "max": 100, "proportion": 1}), "ending before it starts"),
+            (buckets({"min": 0, "max": 3000, "proportion": 0.5},
+                     {"min": 2500, "proportion": 0.5}), "overlapping or unordered"),
+            (buckets({"min": 2500, "max": 4000, "proportion": 0.5},
+                     {"min": 0, "proportion": 0.5}), "overlapping or unordered"),
+            (buckets({"min": 0, "proportion": 0.5},
+                     {"min": 2500, "proportion": 0.5}), "open-ended .* bucket before the last one"),
+        )
+        for extra, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertFieldRefused(extra, expected)
+
+    def test_malformed_field_data_is_refused(self):
+        cases = (
+            ({"loadingExperience": []}, "malformed url field data"),
+            ({"loadingExperience": "x"}, "malformed url field data"),
+            ({"originLoadingExperience": 7}, "malformed origin field data"),
+            ({"loadingExperience": {"metrics": []}}, "malformed url field metrics object"),
+            ({"loadingExperience": {"metrics": "x"}}, "malformed url field metrics object"),
+            ({"loadingExperience": {"id": 7}}, "malformed url field data id"),
+            ({"loadingExperience": {"overall_category": []}}, "malformed url field overall category"),
+            ({"loadingExperience": {"origin_fallback": "true"}}, "malformed url field origin fallback"),
+            ({"loadingExperience": {"origin_fallback": 1}}, "malformed url field origin fallback"),
+            ({"loadingExperience": {"metrics": {"LARGEST_CONTENTFUL_PAINT_MS": None}}},
+             "malformed url LARGEST_CONTENTFUL_PAINT_MS field metric object"),
+            ({"loadingExperience": {"metrics": {"LARGEST_CONTENTFUL_PAINT_MS": {"percentile": "fast"}}}},
+             "malformed url LARGEST_CONTENTFUL_PAINT_MS field metric percentile"),
+            ({"loadingExperience": {"metrics": {"LARGEST_CONTENTFUL_PAINT_MS": {"percentile": NAN}}}},
+             "non-finite url LARGEST_CONTENTFUL_PAINT_MS field metric percentile"),
+            ({"loadingExperience": {"metrics": {"LARGEST_CONTENTFUL_PAINT_MS": {"category": 7}}}},
+             "malformed url LARGEST_CONTENTFUL_PAINT_MS field metric category"),
+            ({"loadingExperience": {"metrics": {"LARGEST_CONTENTFUL_PAINT_MS": {"distributions": None}}}},
+             "malformed url LARGEST_CONTENTFUL_PAINT_MS field distribution collection"),
+            ({"loadingExperience": {"metrics": {"LARGEST_CONTENTFUL_PAINT_MS": {"distributions": ["x"]}}}},
+             "malformed url LARGEST_CONTENTFUL_PAINT_MS field distribution"),
+            ({"loadingExperience": {"metrics": {"LARGEST_CONTENTFUL_PAINT_MS":
+                                                {"distributions": [{"min": "zero", "proportion": 1}]}}}},
+             "malformed url LARGEST_CONTENTFUL_PAINT_MS field distribution minimum"),
+            ({"loadingExperience": {"metrics": {"LARGEST_CONTENTFUL_PAINT_MS":
+                                                {"distributions": [{"max": [], "proportion": 1}]}}}},
+             "malformed url LARGEST_CONTENTFUL_PAINT_MS field distribution maximum"),
+            ({"loadingExperience": {"metrics": {"LARGEST_CONTENTFUL_PAINT_MS":
+                                                {"distributions": [{"min": 0, "proportion": INFINITY}]}}}},
+             "non-finite url LARGEST_CONTENTFUL_PAINT_MS field distribution proportion"),
+        )
+        for extra, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertFieldRefused(extra, expected)
+
+    def test_field_validation_does_not_depend_on_the_output_mode(self):
+        payload = with_field_data(url=field_experience(metrics={
+            "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2400, "distributions": [{"proportion": "most"}]}}))
+        for mode in ("summary", "distributions"):
+            with self.subTest(mode=mode):
+                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                    self.module, "request_json", return_value=payload
+                ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaisesRegex(self.module.PageSpeedError, "field distribution proportion"):
+                        self.module.cmd_analyze(analyze_args(field_data=mode))
+
+    def test_malformed_field_data_exits_two_without_a_traceback(self):
+        payload = with_field_data()
+        payload["loadingExperience"] = []
+        code, emitted, error = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/",
+             "--field-data", "summary"], payload)
+        self.assertEqual(2, code)
+        self.assertEqual("", emitted)
+        self.assertTrue(error.startswith("ERROR: "), error)
+        self.assertNotIn("Traceback", error)
+
+    def test_field_metric_names_and_units_match_the_documented_response_keys(self):
+        # Key strings come from Google's own examples and release notes; see references/cli.md.
+        self.assertEqual(
+            {"FIRST_CONTENTFUL_PAINT_MS": ("first_contentful_paint", "milliseconds"),
+             "LARGEST_CONTENTFUL_PAINT_MS": ("largest_contentful_paint", "milliseconds"),
+             "CUMULATIVE_LAYOUT_SHIFT_SCORE": ("cumulative_layout_shift_score_raw", "api_integer"),
+             "INTERACTION_TO_NEXT_PAINT": ("interaction_to_next_paint", "milliseconds"),
+             "FIRST_INPUT_DELAY_MS": ("first_input_delay", "milliseconds"),
+             "EXPERIMENTAL_TIME_TO_FIRST_BYTE": ("experimental_time_to_first_byte", "milliseconds")},
+            self.module.FIELD_METRICS,
+        )
+        self.assertEqual((("url", "loadingExperience"), ("origin", "originLoadingExperience")),
+                         self.module.FIELD_SCOPES)
+        self.assertEqual(("FAST", "AVERAGE", "SLOW", "NONE"), self.module.FIELD_CATEGORIES)
+        # A field metric shares a lab name only where both measure the same quantity and unit.
+        shared = {name for name, _ in self.module.FIELD_METRICS.values()} & set(self.module.METRICS.values())
+        self.assertEqual({"first_contentful_paint", "largest_contentful_paint",
+                          "interaction_to_next_paint"}, shared)
+        self.assertNotIn("cumulative_layout_shift", shared)
+
+    def test_field_data_json_output_stays_standards_safe(self):
+        emitted, _ = self.analyze(with_field_data(url=field_experience()), field_data="distributions")
+        self.assertNotIn("NaN", emitted)
+        self.assertNotIn("Infinity", emitted)
+        for row in json.loads(emitted):
+            for value in row.values():
+                if isinstance(value, float):
+                    self.assertTrue(math.isfinite(value))
 
     def test_launcher_help_is_credential_free_and_resolves_outside_repo(self):
         result = subprocess.run([str(LAUNCHER), "--help"], cwd="/tmp", env={"PATH": os.environ.get("PATH", "")}, text=True, capture_output=True, check=False)

@@ -10,8 +10,8 @@ confirmation-guarded sitemap submission.
   ecommerce, and direct Analytics Data API reports.
 - `google-merchant` - Merchant Center accounts, product serving status, item issues, bounded product
   performance, and price and market insights.
-- `google-pagespeed-insights` - bounded Lighthouse scores, lab metrics, and prioritized audit findings
-  for public webpages.
+- `google-pagespeed-insights` - bounded Lighthouse scores, lab metrics, prioritized audit
+  findings, and opt-in Chrome UX Report field data for public webpages.
 - `google-search-console` - accessible sites, bounded search performance, sitemaps, URL inspection,
   and confirmation-guarded sitemap submission.
 
