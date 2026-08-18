@@ -465,7 +465,10 @@ class ReportFamilyTest(unittest.TestCase):
                     {"name": "newUsers"},
                     {"name": "engagedSessions"},
                     {"name": "engagementRate"},
-                    {"name": "averageEngagementTimePerSession"},
+                    {
+                        "name": "averageEngagementTimePerSession",
+                        "expression": "userEngagementDuration/sessions",
+                    },
                     {"name": "keyEvents"},
                     {"name": "totalRevenue"},
                 ],
