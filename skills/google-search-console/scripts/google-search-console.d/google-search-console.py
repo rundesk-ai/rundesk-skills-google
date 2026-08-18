@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, read-only access to Google Search Console."""
+"""Bounded Google Search Console reads and one guarded sitemap submission."""
 
 from __future__ import annotations
 
@@ -34,6 +34,17 @@ WEBMASTERS_API = "https://www.googleapis.com/webmasters/v3"
 INSPECTION_API = "https://searchconsole.googleapis.com/v1"
 # Search Console buckets every row by Pacific day, so complete-day defaults must use that zone.
 PACIFIC_ZONE = "America/Los_Angeles"
+# sitemaps.submit is the only writing method in this package. A webmasters.readonly grant cannot
+# call it, and Google will not widen an existing refresh token, so the owner must reauthorize.
+SUBMIT_SCOPE = "https://www.googleapis.com/auth/webmasters"
+FILTER_DIMENSIONS = ("query", "page", "country", "device", "searchAppearance")
+FILTER_OPERATORS = ("contains", "equals", "notContains", "notEquals", "includingRegex", "excludingRegex")
+# Only these two compare the whole dimension value, so only these two can be safely canonicalized.
+EXACT_OPERATORS = ("equals", "notEquals")
+DEVICE_VALUES = ("DESKTOP", "MOBILE", "TABLET")
+COUNTRY_CODE_RE = re.compile(r"[A-Za-z]{3}")
+# Google publishes no expression limit; this bound keeps a mistyped argument out of the request.
+MAX_EXPRESSION = 4096
 
 
 class SearchConsoleError(RuntimeError):
@@ -376,7 +387,74 @@ def date_range(args: argparse.Namespace) -> tuple[str, str]:
     return (end - dt.timedelta(days=args.days - 1)).isoformat(), end.isoformat()
 
 
+def canonical_expression(dimension: str, operator: str, expression: str) -> str:
+    """Case-correct the closed-vocabulary dimensions Google matches exactly.
+
+    A country or device value in the wrong case matches nothing and returns an empty, entirely
+    plausible report. Substring and regex expressions are the caller's own pattern and are sent
+    verbatim, as is searchAppearance, whose vocabulary Google extends without notice.
+    """
+    if operator not in EXACT_OPERATORS:
+        return expression
+    if dimension == "country":
+        if not COUNTRY_CODE_RE.fullmatch(expression):
+            raise SearchConsoleError(
+                f"--filter country:{operator} needs a three-letter ISO 3166-1 alpha-3 code such as usa."
+            )
+        return expression.lower()
+    if dimension == "device":
+        if expression.upper() not in DEVICE_VALUES:
+            raise SearchConsoleError(
+                f"--filter device:{operator} must be one of: " + ", ".join(DEVICE_VALUES) + "."
+            )
+        return expression.upper()
+    return expression
+
+
+def parse_filter(value: str) -> dict[str, str]:
+    """One --filter argument as Google's ApiDimensionFilter object."""
+    # Split twice only, so a page or query expression may contain its own colons.
+    parts = value.split(":", 2)
+    if len(parts) != 3:
+        raise SearchConsoleError(
+            f"--filter {value!r} must be DIMENSION:OPERATOR:EXPRESSION, such as query:contains:running shoes."
+        )
+    dimension, operator, expression = parts
+    if dimension not in FILTER_DIMENSIONS:
+        raise SearchConsoleError(
+            f"--filter dimension {dimension!r} must be one of: " + ", ".join(FILTER_DIMENSIONS) + "."
+        )
+    if operator not in FILTER_OPERATORS:
+        raise SearchConsoleError(
+            f"--filter operator {operator!r} must be one of: " + ", ".join(FILTER_OPERATORS) + "."
+        )
+    if not expression:
+        raise SearchConsoleError(f"--filter {dimension}:{operator} needs a non-empty expression.")
+    if len(expression) > MAX_EXPRESSION:
+        raise SearchConsoleError(
+            f"--filter expression for {dimension} exceeds {MAX_EXPRESSION} characters."
+        )
+    return {
+        "dimension": dimension,
+        "operator": operator,
+        "expression": canonical_expression(dimension, operator, expression),
+    }
+
+
+def dimension_filter_groups(values: list[str]) -> list[dict[str, Any]]:
+    """Every requested filter as the one filter group Google's request body accepts.
+
+    Google ANDs separate groups together and documents only the "and" group type, so a single
+    group already expresses every combination this CLI can build.
+    """
+    if not values:
+        return []
+    return [{"groupType": "and", "filters": [parse_filter(value) for value in values]}]
+
+
 def cmd_performance(args: argparse.Namespace) -> None:
+    # Parsed before configuration so a malformed filter is reported as one, not as a missing profile.
+    groups = dimension_filter_groups(args.filter)
     profile = selected_profile(args)
     start, end = date_range(args)
     body: dict[str, Any] = {"startDate": start, "endDate": end, "rowLimit": args.limit, "startRow": 0}
@@ -384,6 +462,9 @@ def cmd_performance(args: argparse.Namespace) -> None:
         body["dimensions"] = args.dimension
     if args.search_type:
         body["type"] = args.search_type
+    # Omitted entirely when unfiltered, so an unfiltered query keeps its previous request body.
+    if groups:
+        body["dimensionFilterGroups"] = groups
     path = "/sites/" + urllib.parse.quote(args.site, safe="") + "/searchAnalytics/query"
     items = expect_objects(api(profile, path, method="POST", body=body), "rows", "performance row")
     if len(items) == args.limit:
@@ -418,13 +499,88 @@ def cmd_sitemaps(args: argparse.Namespace) -> None:
     write_rows(rows, ["path", "type", "submitted", "downloaded", "pending", "warnings", "errors", "profile"], args.json)
 
 
+def sitemap_path(site: str, sitemap: str) -> str:
+    """The sitemaps.submit and sitemaps.get path for one sitemap.
+
+    Both segments carry a whole URL, so neither may keep the slashes and colon that would otherwise
+    split it across path segments.
+    """
+    return "/sites/" + urllib.parse.quote(site, safe="") + "/sitemaps/" + urllib.parse.quote(sitemap, safe="")
+
+
+def validated_sitemap(site: str, sitemap: str) -> str:
+    parsed = urllib.parse.urlparse(sitemap)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise SearchConsoleError(
+            "--sitemap must be an absolute http or https URL without credentials, "
+            "such as https://www.example.test/sitemap.xml."
+        )
+    # A URL-prefix property only contains sitemaps below its own prefix; a domain property covers
+    # every host it verifies, so only the prefix form can be checked before spending the request.
+    if site.startswith(("http://", "https://")) and not sitemap.startswith(site):
+        print(
+            f"WARNING: {sitemap} is outside the property {site}; Google rejects a sitemap the property does not contain.",
+            file=sys.stderr,
+        )
+    return sitemap
+
+
+def cmd_submit_sitemap(args: argparse.Namespace) -> None:
+    profile = selected_profile(args)
+    sitemap = validated_sitemap(args.site, args.sitemap)
+    path = sitemap_path(args.site, sitemap)
+    if not args.confirm:
+        # The preview resolves only local configuration; it must not reach Google at all, so no
+        # token refresh and no API call may happen before this returns.
+        row = {
+            "site": args.site,
+            "path": sitemap,
+            "method": "PUT",
+            "url": WEBMASTERS_API + path,
+            "scope": SUBMIT_SCOPE,
+            "state": "preview",
+            "profile": profile.name,
+        }
+        write_rows([row], list(row), args.json)
+        raise SearchConsoleError("Refusing to submit without --confirm; the preview above changed nothing.")
+    # Google answers the submission with an empty body, so success is only established by reading
+    # the sitemap back rather than by the absence of an HTTP error.
+    api(profile, path, method="PUT")
+    entry = expect_object(api(profile, path), "sitemap entry")
+    recorded = entry.get("path", "")
+    if not isinstance(recorded, str) or not recorded:
+        raise SearchConsoleError(
+            "Google accepted the submission but did not return the sitemap; verify it in Search Console."
+        )
+    if recorded != sitemap:
+        print(f"WARNING: Google recorded the sitemap as {recorded}.", file=sys.stderr)
+    row = {
+        "site": args.site,
+        "path": recorded,
+        "type": entry.get("type", ""),
+        "submitted": entry.get("lastSubmitted", ""),
+        "downloaded": entry.get("lastDownloaded", ""),
+        "pending": entry.get("isPending", False),
+        "warnings": entry.get("warnings", 0),
+        "errors": entry.get("errors", 0),
+        "state": "submitted",
+        "profile": profile.name,
+    }
+    write_rows([row], list(row), args.json)
+
+
 def parser() -> argparse.ArgumentParser:
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument("--env-file")
     parent.add_argument("--json", action="store_true")
     profile = argparse.ArgumentParser(add_help=False)
     profile.add_argument("--profile")
-    result = argparse.ArgumentParser(prog="google-search-console", description="Read bounded Google Search Console evidence.")
+    result = argparse.ArgumentParser(prog="google-search-console", description="Read bounded Google Search Console evidence and submit a sitemap on explicit confirmation.")
     subs = result.add_subparsers(dest="command", required=True)
     p = subs.add_parser("profiles", parents=[parent], help="List locally configured profiles without contacting Google.")
     p.set_defaults(func=cmd_profiles)
@@ -438,6 +594,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--end-date")
     p.add_argument("--dimension", action="append", choices=["date", "country", "device", "page", "query", "searchAppearance"], default=[])
     p.add_argument("--search-type", choices=["web", "image", "video", "news", "discover", "googleNews"])
+    p.add_argument(
+        "--filter", action="append", default=[], metavar="DIMENSION:OPERATOR:EXPRESSION",
+        help="Repeatable Search Analytics filter; a row must match every filter given.",
+    )
     p.add_argument("--limit", type=int, default=25)
     p.set_defaults(func=cmd_performance)
     p = subs.add_parser("inspect-url", parents=[parent, profile], help="Inspect Google's indexed state for one URL.")
@@ -448,6 +608,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--site", required=True)
     p.add_argument("--limit", type=int, default=25)
     p.set_defaults(func=cmd_sitemaps)
+    p = subs.add_parser("submit-sitemap", parents=[parent, profile], help="Submit one sitemap to Search Console; changes Google state and requires --confirm.")
+    p.add_argument("--site", required=True)
+    p.add_argument("--sitemap", required=True)
+    p.add_argument("--confirm", action="store_true", help="Perform the submission. Without it the command previews the request and refuses.")
+    p.set_defaults(func=cmd_submit_sitemap)
     return result
 
 

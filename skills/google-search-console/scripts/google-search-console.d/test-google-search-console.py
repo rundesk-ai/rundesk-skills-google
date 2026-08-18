@@ -211,7 +211,7 @@ class SearchConsoleTest(unittest.TestCase):
         args = SimpleNamespace(
             profile="example", site="https://www.example.test/", days=28,
             start_date="2026-07-01", end_date="2026-07-31",
-            dimension=["query", "page"], search_type="web", limit=10, json=True,
+            dimension=["query", "page"], search_type="web", filter=[], limit=10, json=True,
         )
         payload = {"rows": [{"keys": ["example", "https://www.example.test/page"], "clicks": 3, "impressions": 20, "ctr": 0.15, "position": 4.2}]}
         with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
@@ -229,7 +229,7 @@ class SearchConsoleTest(unittest.TestCase):
         args = SimpleNamespace(
             profile="example", site="sc-domain:example.test", days=28,
             start_date="2026-07-01", end_date="2026-07-31",
-            dimension=["query"], search_type=None, limit=1, json=False,
+            dimension=["query"], search_type=None, filter=[], limit=1, json=False,
         )
         with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
             self.module, "api", return_value={"rows": [{"keys": ["example"]}]}
@@ -338,7 +338,7 @@ class SearchConsoleTest(unittest.TestCase):
         sites = SimpleNamespace(profile="example", limit=5, json=False)
         performance = SimpleNamespace(
             profile="example", site="sc-domain:example.test", days=28, start_date=None,
-            end_date=None, dimension=["query"], search_type=None, limit=5, json=False,
+            end_date=None, dimension=["query"], search_type=None, filter=[], limit=5, json=False,
         )
         sitemaps = SimpleNamespace(profile="example", site="sc-domain:example.test", limit=5, json=False)
         cases = (
@@ -374,6 +374,291 @@ class SearchConsoleTest(unittest.TestCase):
             code = self.module.main(["sites", "--profile", "example", "--limit", "1001"])
         self.assertEqual(code, 2)
         self.assertIn("between 1 and 1000", error.getvalue())
+
+    def performance_args(self, **overrides):
+        values = dict(
+            profile="example", site="https://www.example.test/", days=28, start_date="2026-07-01",
+            end_date="2026-07-31", dimension=["query"], search_type=None, filter=[], limit=25, json=True,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def performance_body(self, args, payload=None):
+        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+            self.module, "api", return_value=payload if payload is not None else {"rows": []}
+        ) as call, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.module.cmd_performance(args)
+        return call.call_args.kwargs["body"]
+
+    def submit_args(self, **overrides):
+        values = dict(
+            profile="example", site="https://www.example.test/",
+            sitemap="https://www.example.test/sitemap.xml", confirm=False, json=False,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_unfiltered_performance_body_is_exactly_what_it_was_before_filters(self):
+        body = self.performance_body(self.performance_args())
+        self.assertEqual(
+            {"startDate": "2026-07-01", "endDate": "2026-07-31", "rowLimit": 25, "startRow": 0,
+             "dimensions": ["query"]},
+            body,
+        )
+        self.assertNotIn("dimensionFilterGroups", body)
+
+    def test_filters_build_one_official_and_group_in_argument_order(self):
+        args = self.performance_args(filter=[
+            "query:contains:running shoes",
+            "page:equals:https://www.example.test/a:b?x=1&y=2",
+            "country:equals:USA",
+            "device:equals:mobile",
+            "searchAppearance:equals:AMP_BLUE_LINK",
+        ])
+        self.assertEqual(
+            [{"groupType": "and", "filters": [
+                {"dimension": "query", "operator": "contains", "expression": "running shoes"},
+                {"dimension": "page", "operator": "equals",
+                 "expression": "https://www.example.test/a:b?x=1&y=2"},
+                {"dimension": "country", "operator": "equals", "expression": "usa"},
+                {"dimension": "device", "operator": "equals", "expression": "MOBILE"},
+                {"dimension": "searchAppearance", "operator": "equals", "expression": "AMP_BLUE_LINK"},
+            ]}],
+            self.performance_body(args)["dimensionFilterGroups"],
+        )
+
+    def test_substring_and_regex_expressions_are_sent_exactly_as_typed(self):
+        args = self.performance_args(filter=[
+            "country:contains:US", "device:includingRegex:^MOB", "searchAppearance:contains:amp",
+            "query:excludingRegex:(?-i)Brand",
+        ])
+        filters = self.performance_body(args)["dimensionFilterGroups"][0]["filters"]
+        self.assertEqual(
+            ["US", "^MOB", "amp", "(?-i)Brand"], [item["expression"] for item in filters]
+        )
+
+    def test_filtered_performance_request_reaches_google_as_declared_json(self):
+        sent = []
+
+        def opener(request, timeout):
+            sent.append(request)
+            return Response({"rows": []})
+
+        args = self.performance_args(filter=["page:includingRegex:^/blog/.*$", "query:contains:caf\u00e9 & 100%"])
+        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+            self.module, "access_token", return_value="access"
+        ), patch.object(self.module, "open_url", side_effect=opener), redirect_stdout(
+            io.StringIO()
+        ), redirect_stderr(io.StringIO()):
+            self.module.cmd_performance(args)
+        request = sent[0]
+        self.assertEqual("POST", request.get_method())
+        self.assertEqual(
+            "https://www.googleapis.com/webmasters/v3/sites/"
+            "https%3A%2F%2Fwww.example.test%2F/searchAnalytics/query",
+            request.full_url,
+        )
+        self.assertEqual("application/json", request.get_header("Content-type"))
+        # Filters travel in the JSON body, so nothing in them may arrive percent-encoded.
+        self.assertEqual(
+            [{"groupType": "and", "filters": [
+                {"dimension": "page", "operator": "includingRegex", "expression": "^/blog/.*$"},
+                {"dimension": "query", "operator": "contains", "expression": "caf\u00e9 & 100%"},
+            ]}],
+            json.loads(request.data.decode("utf-8"))["dimensionFilterGroups"],
+        )
+
+    def test_malformed_filters_are_refused_before_configuration_or_network(self):
+        cases = (
+            ("", "must be DIMENSION:OPERATOR:EXPRESSION"),
+            ("query", "must be DIMENSION:OPERATOR:EXPRESSION"),
+            ("query:contains", "must be DIMENSION:OPERATOR:EXPRESSION"),
+            ("date:equals:2026-08-01", "dimension 'date' must be one of"),
+            ("hour:equals:5", "dimension 'hour' must be one of"),
+            ("QUERY:equals:shoes", "dimension 'QUERY' must be one of"),
+            ("query:Equals:shoes", "operator 'Equals' must be one of"),
+            ("query:regex:shoes", "operator 'regex' must be one of"),
+            ("query:contains:", "needs a non-empty expression"),
+            ("country:equals:US", "alpha-3"),
+            ("country:equals:united", "alpha-3"),
+            ("country:notEquals:12", "alpha-3"),
+            ("device:equals:phone", "must be one of: DESKTOP, MOBILE, TABLET"),
+            ("device:notEquals:", "needs a non-empty expression"),
+            ("query:contains:" + "x" * 4097, "exceeds 4096 characters"),
+        )
+        for value, expected in cases:
+            with self.subTest(filter=value[:40]):
+                with patch.object(
+                    self.module, "selected_profile", side_effect=AssertionError("configuration")
+                ), patch.object(self.module, "api", side_effect=AssertionError("network")):
+                    with self.assertRaisesRegex(self.module.SearchConsoleError, expected):
+                        self.module.cmd_performance(self.performance_args(filter=[value]))
+
+    def test_main_rejects_a_malformed_filter_without_contacting_google(self):
+        with patch.dict(os.environ, self.env, clear=True), patch.object(
+            self.module.urllib.request, "urlopen", side_effect=AssertionError("network")
+        ), redirect_stderr(io.StringIO()) as error:
+            code = self.module.main([
+                "performance", "--profile", "example", "--site", "sc-domain:example.test",
+                "--filter", "query:like:shoes",
+            ])
+        self.assertEqual(2, code)
+        self.assertIn("operator 'like'", error.getvalue())
+
+    def test_submit_sitemap_previews_without_reaching_google_and_refuses(self):
+        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+            self.module, "api", side_effect=AssertionError("network")
+        ), patch.object(
+            self.module, "access_token", side_effect=AssertionError("network")
+        ), patch.object(
+            self.module, "open_url", side_effect=AssertionError("network")
+        ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(self.module.SearchConsoleError, "without --confirm"):
+                self.module.cmd_submit_sitemap(self.submit_args())
+        printed = output.getvalue()
+        self.assertIn("preview", printed)
+        self.assertIn("PUT", printed)
+        self.assertIn(
+            "https://www.googleapis.com/webmasters/v3/sites/https%3A%2F%2Fwww.example.test%2F"
+            "/sitemaps/https%3A%2F%2Fwww.example.test%2Fsitemap.xml",
+            printed,
+        )
+        self.assertIn("https://www.googleapis.com/auth/webmasters", printed)
+
+    def test_submit_sitemap_preview_exits_two_in_both_output_modes(self):
+        for extra in ([], ["--json"]):
+            with self.subTest(json=bool(extra)):
+                with patch.dict(os.environ, self.env, clear=True), patch.object(
+                    self.module.urllib.request, "urlopen", side_effect=AssertionError("network")
+                ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+                    code = self.module.main([
+                        "submit-sitemap", "--profile", "example", "--site", "https://www.example.test/",
+                        "--sitemap", "https://www.example.test/sitemap.xml", *extra,
+                    ])
+                self.assertEqual(2, code)
+                self.assertIn("Refusing to submit", error.getvalue())
+                if extra:
+                    self.assertEqual("preview", json.loads(output.getvalue())[0]["state"])
+                else:
+                    self.assertIn("preview", output.getvalue())
+
+    def test_submit_sitemap_puts_the_official_path_then_verifies_by_reading_it_back(self):
+        entry = {
+            "path": "https://www.example.test/sitemap.xml", "type": "sitemap", "isPending": True,
+            "lastSubmitted": "2026-08-17T00:00:00.000Z", "warnings": 0, "errors": 0,
+        }
+        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+            self.module, "api", side_effect=[{}, entry]
+        ) as call, redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
+            self.module.cmd_submit_sitemap(self.submit_args(confirm=True, json=True))
+        expected = ("/sites/https%3A%2F%2Fwww.example.test%2F"
+                    "/sitemaps/https%3A%2F%2Fwww.example.test%2Fsitemap.xml")
+        submit, verify = call.call_args_list
+        self.assertEqual((self.profile, expected), submit.args)
+        self.assertEqual({"method": "PUT"}, submit.kwargs)
+        self.assertEqual((self.profile, expected), verify.args)
+        self.assertEqual({}, verify.kwargs)
+        row = json.loads(output.getvalue())[0]
+        self.assertEqual("submitted", row["state"])
+        self.assertEqual("https://www.example.test/sitemap.xml", row["path"])
+        self.assertTrue(row["pending"])
+
+    def test_submit_sitemap_refuses_to_report_success_it_cannot_verify(self):
+        for payload in ({}, {"path": ""}, {"path": 7}, {"errors": 0}):
+            with self.subTest(payload=payload):
+                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                    self.module, "api", side_effect=[{}, payload]
+                ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        self.module.SearchConsoleError, "did not return the sitemap"
+                    ):
+                        self.module.cmd_submit_sitemap(self.submit_args(confirm=True))
+
+    def test_submit_sitemap_refuses_a_malformed_verification_response(self):
+        for payload in ([], "ok", 7, None):
+            with self.subTest(payload=payload):
+                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                    self.module, "api", side_effect=[{}, payload]
+                ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        self.module.SearchConsoleError, "malformed sitemap entry"
+                    ):
+                        self.module.cmd_submit_sitemap(self.submit_args(confirm=True))
+
+    def test_submit_sitemap_reports_a_path_google_rewrote(self):
+        with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+            self.module, "api", side_effect=[{}, {"path": "https://www.example.test/sitemap_index.xml"}]
+        ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+            self.module.cmd_submit_sitemap(self.submit_args(confirm=True))
+        self.assertIn("recorded the sitemap as https://www.example.test/sitemap_index.xml", error.getvalue())
+        self.assertIn("sitemap_index.xml", output.getvalue())
+
+    def test_submit_sitemap_refuses_anything_that_is_not_an_absolute_web_url(self):
+        cases = ("", "sitemap.xml", "/sitemap.xml", "//example.test/sitemap.xml",
+                 "ftp://example.test/sitemap.xml", "file:///etc/passwd", "javascript:alert(1)",
+                 "https:///sitemap.xml", "https://user@example.test/sitemap.xml",
+                 "https://user:password@example.test/sitemap.xml")
+        for value in cases:
+            with self.subTest(sitemap=value):
+                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                    self.module, "api", side_effect=AssertionError("network")
+                ), redirect_stderr(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        self.module.SearchConsoleError, "absolute http or https URL without credentials"
+                    ):
+                        self.module.cmd_submit_sitemap(self.submit_args(sitemap=value, confirm=True))
+
+    def test_submit_sitemap_warns_only_when_a_url_prefix_property_cannot_contain_it(self):
+        cases = (
+            ("https://www.example.test/", "https://other.test/sitemap.xml", True),
+            ("https://www.example.test/", "https://www.example.test/a/sitemap.xml", False),
+            ("sc-domain:example.test", "https://blog.example.test/sitemap.xml", False),
+        )
+        for site, sitemap, warns in cases:
+            with self.subTest(site=site, sitemap=sitemap):
+                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
+                    self.module, "api", side_effect=[{}, {"path": sitemap}]
+                ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
+                    self.module.cmd_submit_sitemap(
+                        self.submit_args(site=site, sitemap=sitemap, confirm=True)
+                    )
+                self.assertEqual(warns, "outside the property" in error.getvalue())
+
+    def test_writing_and_filtering_paths_never_print_credentials_or_tokens(self):
+        env = {
+            "GOOGLE_SEARCH_CONSOLE_CLIENT_ID__EXAMPLE": "leak-client-id",
+            "GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET__EXAMPLE": "leak-client-secret",
+            "GOOGLE_SEARCH_CONSOLE_REFRESH_TOKEN__EXAMPLE": "leak-refresh-token",
+        }
+        secrets = ("leak-client-id", "leak-client-secret", "leak-refresh-token",
+                   "leak-access-token", "Bearer", "Authorization")
+
+        def opener(request, timeout):
+            if request.full_url == self.module.TOKEN_URL:
+                return Response({"access_token": "leak-access-token"})
+            if request.get_method() == "PUT":
+                return RawResponse(b"")
+            if "/sitemaps/" in request.full_url:
+                return Response({"path": "https://www.example.test/sitemap.xml"})
+            return Response({"rows": [{"keys": ["shoes"], "clicks": 1}]})
+
+        base = ["--profile", "example", "--site", "https://www.example.test/"]
+        sitemap = ["--sitemap", "https://www.example.test/sitemap.xml"]
+        commands = (
+            ["submit-sitemap", *base, *sitemap],
+            ["submit-sitemap", *base, *sitemap, "--confirm"],
+            ["submit-sitemap", *base, *sitemap, "--confirm", "--json"],
+            ["performance", *base, "--dimension", "query", "--filter", "query:contains:shoes"],
+        )
+        for argv in commands:
+            with self.subTest(command=" ".join(argv[:1] + argv[5:])):
+                with patch.dict(os.environ, env, clear=True), patch.object(
+                    self.module, "open_url", side_effect=opener
+                ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+                    self.module.main(argv)
+                printed = output.getvalue() + error.getvalue()
+                for secret in secrets:
+                    self.assertNotIn(secret, printed)
 
     def test_launcher_help_is_credential_free_and_resolves_outside_repo(self):
         result = subprocess.run(
