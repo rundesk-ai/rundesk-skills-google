@@ -929,7 +929,7 @@ PERFORMANCE_BREAKDOWNS = {
     "country": ("customer_country_code",),
     "marketing-method": ("marketing_method",),
     "store-type": ("store_type",),
-    "custom-label": ("custom_label_0",),
+    "custom-label": ("custom_label0",),
 }
 # A time series reads in order; every other breakdown reads largest first.
 TIME_BREAKDOWNS = frozenset({"date", "week"})

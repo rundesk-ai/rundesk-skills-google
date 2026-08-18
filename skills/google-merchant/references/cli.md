@@ -119,7 +119,7 @@ only, and segmentation is implicit in which segment columns a breakdown selects.
 | `country` | `customer_country_code` |
 | `marketing-method` | `marketing_method` |
 | `store-type` | `store_type` |
-| `custom-label` | `custom_label_0` |
+| `custom-label` | `custom_label0` |
 | `date` | `date` |
 | `week` | `week` |
 
