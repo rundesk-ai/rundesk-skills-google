@@ -57,8 +57,8 @@ in their owning package instead of turning the lexicon into a field inventory.
 
 - `google-search-console` — accessible sites, bounded and filterable search performance reports,
   sitemaps, URL inspection, and confirmation-guarded sitemap submission.
-- `google-analytics` — accessible GA4 accounts and properties plus bounded Analytics Data API
-  reports.
+- `google-analytics` — accessible GA4 accounts and properties, bounded traffic, audience, key-event,
+  and ecommerce reports, plus direct Analytics Data API queries.
 - `google-pagespeed-insights` — bounded Lighthouse scores, lab metrics, and prioritized audit
   findings for public webpages.
 

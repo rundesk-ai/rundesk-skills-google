@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read bounded Google Analytics 4 account, report, and realtime data."""
+"""Read bounded Google Analytics 4 account, traffic, audience, key-event, commerce, and realtime data."""
 
 from __future__ import annotations
 
@@ -23,7 +23,10 @@ ADMIN_BASE = "https://analyticsadmin.googleapis.com/v1beta"
 DATA_BASE = "https://analyticsdata.googleapis.com/v1beta"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 ACCOUNT_SUFFIX_RE = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)*")
+FIELD_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 MAX_PAGES = 100
+MAX_DIMENSIONS = 9
+MAX_METRICS = 10
 REQUIRED_FIELDS = (
     "GOOGLE_ANALYTICS_CLIENT_ID",
     "GOOGLE_ANALYTICS_CLIENT_SECRET",
@@ -480,10 +483,12 @@ def dimension_metric_names(args: argparse.Namespace) -> Tuple[List[str], List[st
     metrics = split_csv(args.metrics or "")
     if not metrics:
         raise AnalyticsError("At least one metric is required.")
-    if len(dimensions) > 9 or len(metrics) > 10:
-        raise AnalyticsError("Google Analytics reports support at most 9 dimensions and 10 metrics.")
+    if len(dimensions) > MAX_DIMENSIONS or len(metrics) > MAX_METRICS:
+        raise AnalyticsError(
+            f"Google Analytics reports support at most {MAX_DIMENSIONS} dimensions and {MAX_METRICS} metrics."
+        )
     for value in dimensions + metrics:
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", value):
+        if not FIELD_NAME_RE.fullmatch(value):
             raise AnalyticsError(f"Invalid Analytics field name: {value!r}.")
     return dimensions, metrics
 
@@ -544,10 +549,306 @@ def command_realtime(args: argparse.Namespace) -> None:
     warn_truncated(response_row_count(response, len(rows)) > len(rows), limit)
 
 
+# --- Bounded traffic, audience, key-event, and commerce reporting -------------------
+#
+# Every dimension and metric below is a current GA4 Data API v1beta name taken from
+# Google's own predefined report definitions and schema. GA4 renamed conversions to
+# key events in May 2024, so this package uses `isKeyEvent` and `keyEvents` only.
+# These commands report what a property already collects; a property that never sent
+# ecommerce or key events returns empty rows rather than an error.
+
+DATE_FORM_RE = re.compile(r"\d{4}-\d{2}-\d{2}|today|yesterday|\d+daysAgo")
+# GA4 event names: start with a letter, then letters, digits, or underscores, max 40.
+EVENT_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,39}")
+MAX_EVENT_FILTER_VALUES = 25
+
+TRAFFIC_METRICS = (
+    "sessions",
+    "activeUsers",
+    "newUsers",
+    "engagedSessions",
+    "engagementRate",
+    "averageEngagementTimePerSession",
+    "keyEvents",
+    "totalRevenue",
+)
+# Google's own demographic and technology reports pair these metrics with these
+# dimensions, so a user-scoped breakdown such as age stays within a combination
+# Google already publishes.
+AUDIENCE_METRICS = (
+    "activeUsers",
+    "newUsers",
+    "engagedSessions",
+    "engagementRate",
+    "eventCount",
+    "keyEvents",
+    "totalRevenue",
+)
+KEY_EVENT_METRICS = ("keyEvents", "eventCount", "activeUsers", "totalRevenue")
+ITEM_METRICS = ("itemsViewed", "itemsAddedToCart", "itemsCheckedOut", "itemsPurchased", "itemRevenue")
+PURCHASE_METRICS = ("ecommercePurchases", "purchaseRevenue", "totalRevenue")
+REVENUE_METRICS = frozenset({"totalRevenue", "purchaseRevenue", "itemRevenue"})
+
+# Acquisition dimensions are paired with an explicit scope because session-scoped and
+# first-user-scoped attribution answer different questions and are separate API names.
+TRAFFIC_BREAKDOWN_CHOICES = ("channel", "source", "medium", "source-medium", "campaign", "landing-page", "date")
+TRAFFIC_SCOPE_CHOICES = ("session", "first-user")
+TRAFFIC_DIMENSIONS = {
+    ("channel", "session"): ("sessionDefaultChannelGroup",),
+    ("channel", "first-user"): ("firstUserDefaultChannelGroup",),
+    ("source", "session"): ("sessionSource",),
+    ("source", "first-user"): ("firstUserSource",),
+    ("medium", "session"): ("sessionMedium",),
+    ("medium", "first-user"): ("firstUserMedium",),
+    ("source-medium", "session"): ("sessionSource", "sessionMedium"),
+    ("source-medium", "first-user"): ("firstUserSource", "firstUserMedium"),
+    ("campaign", "session"): ("sessionCampaignName",),
+    ("campaign", "first-user"): ("firstUserCampaignName",),
+    ("landing-page", "session"): ("landingPage",),
+    ("date", "session"): ("date",),
+}
+
+AUDIENCE_BREAKDOWN_CHOICES = (
+    "audience", "country", "region", "city", "language", "device", "browser", "operating-system", "platform", "age", "gender",
+)
+AUDIENCE_DIMENSIONS = {
+    "audience": ("audienceName",),
+    "country": ("country",),
+    "region": ("region",),
+    "city": ("city",),
+    "language": ("language",),
+    "device": ("deviceCategory",),
+    "browser": ("browser",),
+    "operating-system": ("operatingSystem",),
+    "platform": ("platform",),
+    "age": ("userAgeBracket",),
+    "gender": ("userGender",),
+}
+# Google withholds small groups for these dimensions, so a caller must not read a
+# short result as the property's whole audience.
+THRESHOLDED_BREAKDOWNS = frozenset({"age", "gender"})
+
+KEY_EVENT_BREAKDOWN_CHOICES = ("event", "date", "channel")
+KEY_EVENT_DIMENSIONS = {
+    "event": ("eventName",),
+    "date": ("date",),
+    "channel": ("sessionDefaultChannelGroup",),
+}
+
+COMMERCE_BREAKDOWN_CHOICES = ("item", "item-id", "brand", "category", "list", "date", "channel")
+COMMERCE_DIMENSIONS = {
+    "item": ("itemName",),
+    "item-id": ("itemId",),
+    "brand": ("itemBrand",),
+    "category": ("itemCategory",),
+    "list": ("itemListName",),
+    "date": ("date",),
+    "channel": ("sessionDefaultChannelGroup",),
+}
+# Item-scoped metrics only combine with item-scoped dimensions, so a product breakdown
+# and a purchase breakdown carry different metric sets by construction.
+COMMERCE_ITEM_BREAKDOWNS = frozenset({"item", "item-id", "brand", "category", "list"})
+
+
+@dataclass(frozen=True)
+class Breakdown:
+    """One bounded report shape: what to group by, what to measure, and how to rank."""
+
+    dimensions: Tuple[str, ...]
+    metrics: Tuple[str, ...]
+    order_metric: str = ""
+    purchase_metric: str = ""
+
+
+def build_breakdown(
+    dimensions: Tuple[str, ...],
+    metrics: Tuple[str, ...],
+    order_metric: str,
+    purchase_metric: str = "",
+) -> Breakdown:
+    # A day-by-day breakdown reads as a time series, so it sorts by date instead of size.
+    ranked_by = "" if dimensions[0] == "date" else order_metric
+    return Breakdown(dimensions, metrics, ranked_by, purchase_metric)
+
+
+def bounded_date(value: str, option: str) -> str:
+    """Accept only the date forms the Data API's DateRange documents."""
+    if not DATE_FORM_RE.fullmatch(value or ""):
+        raise AnalyticsError(
+            f"{option} must be YYYY-MM-DD, today, yesterday, or NdaysAgo, got {value!r}."
+        )
+    return value
+
+
+def validated_fields(dimensions: Sequence[str], metrics: Sequence[str]) -> None:
+    """Guard the request the same way caller-supplied report fields are guarded."""
+    if not metrics:
+        raise AnalyticsError("At least one metric is required.")
+    if len(dimensions) > MAX_DIMENSIONS or len(metrics) > MAX_METRICS:
+        raise AnalyticsError(
+            f"Google Analytics reports support at most {MAX_DIMENSIONS} dimensions and {MAX_METRICS} metrics."
+        )
+    for value in list(dimensions) + list(metrics):
+        if not FIELD_NAME_RE.fullmatch(value):
+            raise AnalyticsError(f"Invalid Analytics field name: {value!r}.")
+
+
+def key_event_filter() -> Dict[str, Any]:
+    """Restrict a report to events the property marks as key events."""
+    return {"filter": {"fieldName": "isKeyEvent", "stringFilter": {"matchType": "EXACT", "value": "true"}}}
+
+
+def event_name_filter(names: Sequence[str]) -> Dict[str, Any]:
+    """Restrict a report to named events, matched exactly because GA4 event names are case sensitive."""
+    if not names:
+        raise AnalyticsError("--event needs at least one GA4 event name.")
+    if len(names) > MAX_EVENT_FILTER_VALUES:
+        raise AnalyticsError(f"--event accepts at most {MAX_EVENT_FILTER_VALUES} event names.")
+    for name in names:
+        if not EVENT_NAME_RE.fullmatch(name):
+            raise AnalyticsError(
+                f"Invalid GA4 event name: {name!r}. Event names start with a letter and use letters, digits, or underscores."
+            )
+    return {"filter": {"fieldName": "eventName", "inListFilter": {"values": list(names), "caseSensitive": True}}}
+
+
+def all_of(expressions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(expressions) == 1:
+        return expressions[0]
+    return {"andGroup": {"expressions": expressions}}
+
+
+def positive_metric_filter(metric: str) -> Dict[str, Any]:
+    """Drop rows that recorded none of the measured purchases."""
+    return {
+        "filter": {
+            "fieldName": metric,
+            "numericFilter": {"operation": "GREATER_THAN", "value": {"int64Value": "0"}},
+        }
+    }
+
+
+def order_bys(breakdown: Breakdown) -> List[Dict[str, Any]]:
+    if breakdown.order_metric:
+        return [{"metric": {"metricName": breakdown.order_metric}, "desc": True}]
+    return [{"dimension": {"dimensionName": breakdown.dimensions[0]}, "desc": False}]
+
+
+def report_notices(response: Dict[str, Any], metrics: Sequence[str]) -> None:
+    """Repeat Google's own caveats so a bounded row set is not read as the whole truth."""
+    metadata = expect_object(response.get("metadata", {}), "report metadata")
+    if metadata.get("subjectToThresholding"):
+        print(
+            "WARNING: Google withheld rows below its aggregation thresholds; small groups are missing.",
+            file=sys.stderr,
+        )
+    if metadata.get("dataLossFromOtherRow"):
+        print('WARNING: Google rolled low-volume rows into an "(other)" row.', file=sys.stderr)
+    if expect_objects(metadata, "samplingMetadatas", "sampling metadata"):
+        print("WARNING: Google sampled this report; values are estimates.", file=sys.stderr)
+    reason = metadata.get("emptyReason")
+    if isinstance(reason, str) and reason:
+        print(f"NOTE: Google returned no rows: {reason}", file=sys.stderr)
+    currency = metadata.get("currencyCode")
+    if isinstance(currency, str) and currency and any(metric in REVENUE_METRICS for metric in metrics):
+        print(f"NOTE: Revenue is reported in {currency}.", file=sys.stderr)
+
+
+def run_breakdown_report(
+    args: argparse.Namespace,
+    breakdown: Breakdown,
+    dimension_filter: Optional[Dict[str, Any]] = None,
+    metric_filter: Optional[Dict[str, Any]] = None,
+    notes: Sequence[str] = (),
+) -> None:
+    profile = get_profile(selected_profile_name(args))
+    property_id = resource_id(args.property, "properties")
+    limit = bounded_limit(args.limit)
+    dimensions = list(breakdown.dimensions)
+    metrics = list(breakdown.metrics)
+    validated_fields(dimensions, metrics)
+    payload: Dict[str, Any] = {
+        "dateRanges": [
+            {
+                "startDate": bounded_date(args.start_date, "--start-date"),
+                "endDate": bounded_date(args.end_date, "--end-date"),
+            }
+        ],
+        "dimensions": [{"name": name} for name in dimensions],
+        "metrics": [{"name": name} for name in metrics],
+        "orderBys": order_bys(breakdown),
+        "limit": str(limit),
+    }
+    if dimension_filter is not None:
+        payload["dimensionFilter"] = dimension_filter
+    if metric_filter is not None:
+        payload["metricFilter"] = metric_filter
+    response = api_request(
+        refresh_access_token(profile),
+        "POST",
+        f"{DATA_BASE}/properties/{property_id}:runReport",
+        payload=payload,
+    )
+    rows = normalized_report(response, dimensions, metrics, profile, property_id)
+    emit_report(rows, dimensions, metrics, args)
+    for note in notes:
+        print(f"NOTE: {note}", file=sys.stderr)
+    report_notices(response, metrics)
+    warn_truncated(response_row_count(response, len(rows)) > len(rows), limit)
+
+
+def command_traffic(args: argparse.Namespace) -> None:
+    dimensions = TRAFFIC_DIMENSIONS.get((args.breakdown, args.scope))
+    if dimensions is None:
+        raise AnalyticsError(
+            f"--breakdown {args.breakdown} has no {args.scope} form; run it with --scope session."
+        )
+    run_breakdown_report(args, build_breakdown(dimensions, TRAFFIC_METRICS, "sessions"))
+
+
+def command_audience(args: argparse.Namespace) -> None:
+    breakdown = build_breakdown(AUDIENCE_DIMENSIONS[args.breakdown], AUDIENCE_METRICS, "activeUsers")
+    notes = ()
+    if args.breakdown in THRESHOLDED_BREAKDOWNS:
+        notes = (
+            "Google applies aggregation thresholds to age and gender, and reports them only for "
+            "properties that enabled Google signals.",
+        )
+    run_breakdown_report(args, breakdown, notes=notes)
+
+
+def command_key_events(args: argparse.Namespace) -> None:
+    breakdown = build_breakdown(KEY_EVENT_DIMENSIONS[args.breakdown], KEY_EVENT_METRICS, "keyEvents")
+    expressions = [key_event_filter()]
+    if args.event is not None:
+        expressions.append(event_name_filter(split_csv(args.event)))
+    run_breakdown_report(args, breakdown, dimension_filter=all_of(expressions))
+
+
+def command_commerce(args: argparse.Namespace) -> None:
+    if args.breakdown in COMMERCE_ITEM_BREAKDOWNS:
+        breakdown = build_breakdown(
+            COMMERCE_DIMENSIONS[args.breakdown], ITEM_METRICS, "itemRevenue", "itemsPurchased"
+        )
+    else:
+        breakdown = build_breakdown(
+            COMMERCE_DIMENSIONS[args.breakdown], PURCHASE_METRICS, "purchaseRevenue", "ecommercePurchases"
+        )
+    metric_filter = positive_metric_filter(breakdown.purchase_metric) if args.purchased_only else None
+    run_breakdown_report(args, breakdown, metric_filter=metric_filter)
+
+
 def add_profile_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--env-file", help="Load an explicit dotenv after existing process variables")
     parser.add_argument("--profile", help="Configured Google Analytics profile")
     parser.add_argument("--json", action="store_true", help="Emit normalized JSON")
+
+
+def add_report_window(parser: argparse.ArgumentParser, default_limit: int) -> None:
+    parser.add_argument("--property", required=True, help="Numeric GA4 property ID")
+    parser.add_argument("--start-date", default="28daysAgo", help="YYYY-MM-DD, today, yesterday, or NdaysAgo")
+    parser.add_argument("--end-date", default="today", help="YYYY-MM-DD, today, yesterday, or NdaysAgo")
+    parser.add_argument("--limit", type=int, default=default_limit)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -587,6 +888,38 @@ def build_parser() -> argparse.ArgumentParser:
     realtime.add_argument("--dimensions", default="")
     realtime.add_argument("--limit", type=int, default=25)
     realtime.set_defaults(handler=command_realtime)
+
+    traffic = subparsers.add_parser("traffic", help="Report where sessions came from")
+    add_profile_option(traffic)
+    add_report_window(traffic, 25)
+    traffic.add_argument("--breakdown", choices=TRAFFIC_BREAKDOWN_CHOICES, default="channel")
+    traffic.add_argument(
+        "--scope", choices=TRAFFIC_SCOPE_CHOICES, default="session",
+        help="Attribute to the session or to the user's first visit",
+    )
+    traffic.set_defaults(handler=command_traffic)
+
+    audience = subparsers.add_parser("audience", help="Report aggregated audience, geography, and technology")
+    add_profile_option(audience)
+    add_report_window(audience, 25)
+    audience.add_argument("--breakdown", choices=AUDIENCE_BREAKDOWN_CHOICES, default="country")
+    audience.set_defaults(handler=command_audience)
+
+    key_events = subparsers.add_parser("key-events", help="Report key events, the GA4 name for conversions and leads")
+    add_profile_option(key_events)
+    add_report_window(key_events, 25)
+    key_events.add_argument("--breakdown", choices=KEY_EVENT_BREAKDOWN_CHOICES, default="event")
+    key_events.add_argument("--event", help="Comma-separated GA4 event names to isolate")
+    key_events.set_defaults(handler=command_key_events)
+
+    commerce = subparsers.add_parser("commerce", help="Report ecommerce item, purchase, and revenue behavior")
+    add_profile_option(commerce)
+    add_report_window(commerce, 25)
+    commerce.add_argument("--breakdown", choices=COMMERCE_BREAKDOWN_CHOICES, default="item")
+    commerce.add_argument(
+        "--purchased-only", action="store_true", help="Drop rows with no purchase in the window",
+    )
+    commerce.set_defaults(handler=command_commerce)
 
     return parser
 
