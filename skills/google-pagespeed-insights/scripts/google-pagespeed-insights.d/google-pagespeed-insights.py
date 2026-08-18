@@ -63,6 +63,10 @@ FIELD_METRICS = {
     "EXPERIMENTAL_TIME_TO_FIRST_BYTE": ("experimental_time_to_first_byte", MILLISECONDS),
 }
 FIELD_CATEGORIES = ("FAST", "AVERAGE", "SLOW", "NONE")
+# Both scopes at their documented six metrics with three buckets each come to fifty rows, so the
+# default holds a complete current response while still bounding a response that grows.
+FIELD_LIMIT_DEFAULT = 100
+FIELD_LIMIT_MAXIMUM = 500
 # Returned proportions are rounded, so their total is checked with room for that rounding only.
 DISTRIBUTION_TOLERANCE = 0.02
 LAB_COLUMNS = ["row_type", "category", "metric", "audit", "title", "score", "value",
@@ -234,18 +238,26 @@ def optional_number(container: dict[str, Any], key: str, noun: str) -> int | flo
 
 
 def optional_flag(container: dict[str, Any], key: str, noun: str) -> bool | None:
-    """Only a real JSON boolean is accepted; an unreported flag is not a false one."""
-    value = container.get(key)
-    if value is None:
+    """`None` only for an absent flag, the boolean for a reported one, a refusal for anything else.
+
+    Keeping absent distinct from false in code is what lets a caller decide the meaning of silence
+    without confusing it with a value Google sent in the wrong type.
+
+    **Absent and explicitly null are two different answers.** Google omits a flag it has nothing to
+    say about; a literal `null` is a payload that said something, and what it said is not a
+    boolean. Read alike, a malformed response arrives as the ordinary case and is reported as a
+    confident `false` — the one reading nobody would question.
+    """
+    if key not in container:
         return None
-    if not isinstance(value, bool):
+    if not isinstance(container[key], bool):
         raise PageSpeedError(f"Google returned a malformed {noun}.")
-    return value
+    return container[key]
 
 
-def flag_text(value: bool | None) -> str:
-    """Both output modes render a flag identically, and an absent flag stays visibly absent."""
-    return "" if value is None else ("true" if value else "false")
+def fallback_text(value: bool | None) -> str:
+    """Google omits origin_fallback unless it is true, so absent and false both mean not a fallback."""
+    return "true" if value is True else "false"
 
 
 def expect_category(container: dict[str, Any], key: str, noun: str) -> str:
@@ -361,14 +373,25 @@ def scope_rows(experience: dict[str, Any], scope: str, common: dict[str, Any], *
     # so row order does not depend on JSON key order.
     ordered = [key for key in FIELD_METRICS if key in metrics]
     ordered += sorted(key for key in metrics if key not in FIELD_METRICS)
+    # **Only the page-level reading can be a fallback.** `origin_fallback` says "this URL had too
+    # few samples, so what you are reading is the origin's" — a statement origin-level data cannot
+    # make about itself, and one Google never puts there. A payload that does is not one this
+    # command understands, and deciding what it might have meant would put a claim in the output
+    # that Google did not make.
+    if scope != "url" and "origin_fallback" in experience:
+        raise PageSpeedError(
+            f"Google returned an origin fallback on {scope} field data, which it does not report.")
+    # Google sends origin_fallback only when it is true, so an absent flag is the common case and
+    # means the reading is not a fallback. `is True` keeps that apart from a wrong-typed value,
+    # which optional_flag has already refused.
     fallback = optional_flag(experience, "origin_fallback", f"{scope} field origin fallback")
     # A page without enough samples is answered with origin data. Reporting only the scope that was
     # asked about would present site-wide data as the page's, so both are named on every row.
     attribution = {
         **common,
         "requested_scope": scope,
-        "effective_scope": "origin" if scope == "url" and fallback else scope,
-        "origin_fallback": flag_text(fallback),
+        "effective_scope": "origin" if scope == "url" and fallback is True else scope,
+        "origin_fallback": fallback_text(fallback),
         "field_id": expect_text(experience, "id", f"{scope} field data id"),
     }
     rows = [{
@@ -428,6 +451,17 @@ def analyze_columns(field_data: str) -> list[str]:
     return columns + CONTEXT_COLUMNS
 
 
+def bounded_field_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Field rows are bounded like every other read here, and a drop is never silent.
+
+    Rows are dropped from the end of the emission order, so the requested page's scope survives a
+    small bound before the origin's does.
+    """
+    if len(rows) > limit:
+        print(f"WARNING: field output truncated to {limit} rows.", file=sys.stderr)
+    return rows[:limit]
+
+
 def runtime_failure(lighthouse: dict[str, Any]) -> str:
     """The reported reason Lighthouse produced no assessment, or empty when it produced one."""
     runtime_error = expect_object(lighthouse.get("runtimeError", {}), "Lighthouse runtime error")
@@ -449,7 +483,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     lighthouse = expect_object(response.get("lighthouseResult", {}), "Lighthouse result")
     if not lighthouse:
         raise PageSpeedError("Google returned no Lighthouse result for the requested URL.")
-    failure = runtime_failure(lighthouse)
+    lab_failure = runtime_failure(lighthouse)
     common = {
         "requested_url": expect_text(lighthouse, "requestedUrl", "requested URL") or args.url,
         "final_url": expect_text(lighthouse, "finalUrl", "final URL"),
@@ -458,19 +492,27 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         "lighthouse_version": expect_text(lighthouse, "lighthouseVersion", "Lighthouse version"),
         "profile": profile.name,
     }
-    # Requested field data is validated before anything is written, so a malformed response still
-    # produces no output whether or not Lighthouse also failed.
-    field = [] if args.field_data == "none" else field_rows(
-        response, common, distributions=args.field_data == "distributions")
+    # Field data is an optional extra section. Validating it must never cost the caller the lab
+    # assessment they asked for, so a refusal is recorded and reported rather than raised.
+    field: list[dict[str, Any]] = []
+    field_failure = ""
+    field_returned = False
+    if args.field_data != "none":
+        try:
+            field = field_rows(response, common, distributions=args.field_data == "distributions")
+        except PageSpeedError as exc:
+            field_failure = f"Requested Chrome UX Report field data was not reported. {exc}"
+        field_returned = bool(field)
+        field = bounded_field_rows(field, args.field_limit)
     columns = analyze_columns(args.field_data)
-    if failure:
-        # The lab half of the request failed, so no lab row is invented. Field data that was asked
-        # for and survived validation is still worth reporting, but analyze was only partly
-        # satisfied, so the exit status stays a failure.
-        if not field:
-            raise PageSpeedError(failure)
-        print(f"ERROR: {failure}", file=sys.stderr)
-        write_rows(field, columns, args.json)
+    if lab_failure:
+        # The lab half of the request failed, so no lab row is invented from it. Field data that
+        # was asked for and survived validation is still worth reporting.
+        print(f"ERROR: {lab_failure}", file=sys.stderr)
+        if field_failure:
+            print(f"ERROR: {field_failure}", file=sys.stderr)
+        if field:
+            write_rows(field, columns, args.json)
         return 2
     returned_categories = expect_object(lighthouse.get("categories", {}), "Lighthouse categories object")
     audits = expect_object(lighthouse.get("audits", {}), "Lighthouse audits object")
@@ -507,11 +549,16 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     findings.sort(key=lambda item: (-item["weight"], item["score"], item["audit"]))
     if len(findings) > args.audit_limit:
         print(f"WARNING: audit output truncated to {args.audit_limit} findings.", file=sys.stderr)
-    if args.field_data != "none" and not field:
-        # Silence would read as good field data; this URL and origin simply have no CrUX samples.
-        print("NOTE: Google returned no Chrome UX Report field data for this URL or origin.", file=sys.stderr)
+    if args.field_data != "none":
+        if field_failure:
+            print(f"ERROR: {field_failure}", file=sys.stderr)
+        elif not field_returned:
+            # Silence would read as good field data; this URL and origin simply have no CrUX samples.
+            print("NOTE: Google returned no Chrome UX Report field data for this URL or origin.", file=sys.stderr)
     write_rows(summaries + metrics + field + findings[:args.audit_limit], columns, args.json)
-    return 0
+    # The lab rows the caller asked for are complete, but a requested section that could not be
+    # produced is still work that did not happen, so the status records it.
+    return 2 if field_failure else 0
 
 
 def parser() -> argparse.ArgumentParser:
@@ -531,6 +578,7 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--audit-limit", type=int, default=10)
     # Default off: an existing caller's output must not change shape because field data was added.
     command.add_argument("--field-data", choices=["summary", "distributions", "none"], default="none")
+    command.add_argument("--field-limit", type=int, default=FIELD_LIMIT_DEFAULT)
     command.set_defaults(func=cmd_analyze)
     return result
 
@@ -541,6 +589,8 @@ def main(argv: list[str] | None = None) -> int:
         load_dotenv(resolve_env_file(args.env_file), required=bool(args.env_file))
         if hasattr(args, "audit_limit") and not 0 <= args.audit_limit <= 50:
             raise PageSpeedError("--audit-limit must be between 0 and 50.")
+        if hasattr(args, "field_limit") and not 0 <= args.field_limit <= FIELD_LIMIT_MAXIMUM:
+            raise PageSpeedError(f"--field-limit must be between 0 and {FIELD_LIMIT_MAXIMUM}.")
         return args.func(args)
     except PageSpeedError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

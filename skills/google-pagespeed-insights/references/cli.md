@@ -6,7 +6,7 @@
 google-pagespeed-insights profiles
 google-pagespeed-insights analyze --profile example --url https://www.example.test/
 google-pagespeed-insights analyze --profile example --url https://www.example.test/ --strategy desktop --category performance --category accessibility --category best-practices --category seo --audit-limit 10
-google-pagespeed-insights analyze --profile example --url https://www.example.test/ --field-data distributions
+google-pagespeed-insights analyze --profile example --url https://www.example.test/ --field-data distributions --field-limit 100
 google-pagespeed-insights analyze --profile example --url https://www.example.test/ --field-data none
 ```
 
@@ -19,6 +19,33 @@ individual audit findings. Repeat `--category` to request multiple Lighthouse ca
 of the Chrome UX Report field data already present in the response are reported; it never changes
 the request. The default is `none` so that a caller written before field data existed receives
 byte-for-byte the same CSV header, CSV body, and JSON row set it always received.
+
+`--field-limit` bounds how many field rows are emitted. It accepts 0 through 500 and defaults to
+100, which holds a complete current response for both scopes with distributions; zero emits no
+field row at all. Rows are dropped from the end of the emission order, so the requested page's
+scope survives a small bound before the origin's does, and a drop is always reported on stderr.
+
+## Exit status
+
+`analyze` exits 0 only when every section the invocation asked for was produced. It exits 2 when a
+requested section could not be produced, and whatever valid rows do exist are still written to
+stdout so a usable result is never thrown away with the unusable one:
+
+| Situation | stdout | stderr | Status |
+|---|---|---|---|
+| Everything requested was produced | all rows | nothing, or a bound or empty-data note | 0 |
+| Output reached `--audit-limit` or `--field-limit` | the bounded rows | `WARNING:` truncation notice | 0 |
+| Field data requested and Google returned none | lab rows | `NOTE:` no field data | 0 |
+| Field data requested and its payload is malformed | lab rows | `ERROR:` naming the field-data problem | 2 |
+| Lighthouse reported a `runtimeError` | valid field rows, if any | `ERROR:` naming the lab failure | 2 |
+| Lighthouse and requested field data both failed | field rows, if any survived | one `ERROR:` per failed section | 2 |
+| The response has no `lighthouseResult`, or is malformed outside the field data | nothing | `ERROR:` | 2 |
+
+Three stderr prefixes carry that grammar: `ERROR:` marks requested work that did not happen and
+always accompanies status 2, `WARNING:` marks output a documented bound truncated, and `NOTE:`
+marks a section Google legitimately had nothing to report for. Neither `WARNING:` nor `NOTE:`
+changes the exit status. A malformed optional field-data payload never suppresses the lab
+assessment, because the lab result is the work the caller asked for and it succeeded.
 
 The command reports category scores, selected lab metrics, and the highest-weighted audits whose
 score is below 1. Audits without a numeric score are omitted from the compact finding list. Google
@@ -58,16 +85,38 @@ to be interpreted from its neighbours.
 `requested_scope` names the object Google was asked about and `effective_scope` names what the data
 describes:
 
-| Response field | `requested_scope` | `effective_scope` | `origin_fallback` |
+| Response shape | `requested_scope` | `effective_scope` | `origin_fallback` |
 |---|---|---|---|
-| `loadingExperience` | `url` | `url` | `false` |
-| `loadingExperience` with `origin_fallback` | `url` | `origin` | `true` |
-| `originLoadingExperience` | `origin` | `origin` | empty |
+| `loadingExperience` without `origin_fallback` | `url` | `url` | `false` |
+| `loadingExperience` with `origin_fallback: false` | `url` | `url` | `false` |
+| `loadingExperience` with `origin_fallback: true` | `url` | `origin` | `true` |
+| `originLoadingExperience`, which never carries the field | `origin` | `origin` | `false` |
+| `originLoadingExperience` carrying the field at all | refused | refused | refused |
+| either object with `origin_fallback: null` | refused | refused | refused |
 
-`origin_fallback` is the raw API boolean, reported verbatim and absent on `originLoadingExperience`;
-`effective_scope` is derived from it. Reading `effective_scope` alone cannot distinguish a page that
-fell back from a genuine origin reading, so both columns are needed to attribute a row. Booleans are
-rendered as `true` and `false` in both output modes.
+Google omits `origin_fallback` entirely in the common case rather than sending `false`. Absent and
+an explicit `false` mean the same thing — this reading is not an origin fallback — so both are
+reported as `false` and the column has one spelling. Only a value Google actually sent as `true`
+produces `true`, and only that value moves `effective_scope` to `origin`.
+
+Two shapes are refused rather than interpreted, and both would otherwise be read as a confident
+`false`:
+
+- **`origin_fallback` on `originLoadingExperience`.** The flag says "this URL had too few samples,
+  so you are reading the origin's data" — which origin-level data cannot say about itself. Google
+  never sends it there, so a response that does is not one this command understands.
+- **An explicit `origin_fallback: null`.** Absent means Google had nothing to say; `null` means it
+  answered, and what it answered is not a boolean. Read alike, a malformed response would arrive as
+  the ordinary case.
+
+The absent case therefore stays distinct from a malformed one inside the command: the parser
+returns "absent" only for a key that is not present, the boolean for a reported one, and refuses
+anything else. A response can never be read as "not a fallback" because its flag arrived in the
+wrong type or in the wrong place.
+
+Reading `effective_scope` alone cannot distinguish a page that fell back from a genuine origin
+reading, so both scope columns are needed to attribute a row. Booleans are rendered as `true` and
+`false` in both output modes.
 
 ### Percentile, units, and metric names
 
@@ -104,14 +153,34 @@ empty `percentile` means no value was reported, while `0` is a real measurement.
 `fetch_time` and `lighthouse_version` on a field row describe the lab run in the same response, not
 the field-data window.
 
+### Bounded field rows
+
+Field rows are bounded like every other read in this catalog. `--field-limit` defaults to 100, which
+holds a complete current response — two scopes, six documented metrics, three buckets each — so the
+bound does not silently shorten a normal reading. When Google returns more rows than the bound,
+`WARNING: field output truncated to <limit> rows.` is written to stderr and the exit status stays 0,
+because the bound was honoured rather than requested work failing. Rows are dropped from the end of
+the emission order, which is the `url` scope followed by the `origin` scope, each as a summary then
+its metrics and their buckets. `--field-limit 0` emits no field row and still reports the drop, so
+an empty field section is never mistaken for Google having no data.
+
 ### Partial results
+
+`analyze` treats the lab assessment and the optional field data as two sections and reports each on
+its own terms. A refused optional section never removes a section that succeeded.
 
 When Lighthouse reports a `runtimeError`, the lab assessment does not exist and no score, metric, or
 audit row is invented from it. If field data was requested and passed validation, those rows are
 written to stdout, the Lighthouse failure is reported on stderr, and the command exits 2 because
-`analyze` was only partly satisfied. If field data was not requested, none was returned, or it
+`analyze` was only partly satisfied. If field data was not requested, none was returned, or it also
 failed validation, nothing is written to stdout and the command exits 2. A response with no
 `lighthouseResult` at all remains a hard failure with no output.
+
+When Lighthouse succeeded and only the requested field data is malformed, the lab rows are written
+to stdout exactly as they would have been, the field-data problem is named on stderr as an `ERROR:`,
+and the command exits 2. The caller keeps the assessment it asked for and still learns, from both
+stderr and the status, that the optional section it also asked for did not happen. Losing a valid
+lab result to a malformed optional payload would discard work Google did do.
 
 The Lighthouse result is validated before use: the result, its `categories` and `audits` objects,
 each category object, each `auditRefs` list and element, and each audit object must have the shape
@@ -131,7 +200,8 @@ ordering and overlap cannot be judged without it.
 
 Requested field data is validated before anything is written, including when Lighthouse also failed,
 and distribution buckets are validated whether or not `--field-data` prints them, so neither the
-output mode nor a lab failure decides which responses are refused. Scores, audit-reference weights,
+output mode nor a lab failure decides which responses are refused. A field-data refusal is reported
+and costs the exit status; it does not cost a lab assessment that succeeded. Scores, audit-reference weights,
 and numeric metric values must be finite numbers. A malformed, null, or wrong-shaped response is reported on stderr and exits 2 rather than
 producing a partial reading, and JSON output never contains `NaN` or `Infinity`, which are not
 valid JSON.
@@ -176,6 +246,7 @@ profile's API key.
 - Audit rows: audit identifier, title, score, display value, weighted impact, and profile.
 - Field rows: requested and effective scope, origin fallback, CrUX identifier, metric, raw metric
   key, unit, percentile, category, and, when requested, distribution bucket bounds and proportions.
+  Bounded by `--field-limit`.
 
 Rows are emitted as category summaries, lab metrics, field data, then audit findings. Column order
 is stable, and the field and distribution columns are present only when those rows were requested.
@@ -205,7 +276,7 @@ hostile fixtures for null, wrong-shaped, and non-finite values.
 - [PageSpeed Insights v5 discovery document](https://pagespeedonline.googleapis.com/$discovery/rest?version=v5)
 
 The runPagespeed reference defines the response fields, including the snake_case `overall_category`,
-`initial_url`, and `origin_fallback`, and the metric shape of `percentile`, `distributions` with
+`initial_url`, and the optional `origin_fallback`, and the metric shape of `percentile`, `distributions` with
 `min`, `max`, and `proportion`, and a `category` of `FAST`, `AVERAGE`, `SLOW`, or `NONE`. The About
 page defines the 28-day window and daily updates, names the reported metrics, and presents the
 75th percentile.

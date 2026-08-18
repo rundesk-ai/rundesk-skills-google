@@ -102,6 +102,22 @@ and `category` for Google's performance, accessibility, best-practices, and SEO 
 lowercase names are the Lighthouse result keys; the query enums are `PERFORMANCE`, `ACCESSIBILITY`,
 `BEST_PRACTICES`, and `SEO`. Keep the lowercase form everywhere except the request itself.
 
+### Field data
+
+The Chrome UX Report summary of real users' recent experiences that PageSpeed Insights returns
+beside the Lighthouse run. Use `field data` for it and `lab` for the Lighthouse assessment, and
+never present one as evidence for the other. It is not Core Web Vitals history; it is one trailing
+window.
+
+### Scope
+
+Which object a field-data reading describes. `url` is the requested page and `origin` is the whole
+site; the API spells them `loadingExperience` and `originLoadingExperience`. Report the requested
+scope and the effective scope together, because Google answers a page with too few samples using
+origin data and marks that with `origin_fallback`. Google omits `origin_fallback` unless it is
+true, so an absent flag means the reading is not a fallback. Do not call a scope a property, a
+site, or a domain.
+
 ## Merchant Center
 
 ### Merchant account

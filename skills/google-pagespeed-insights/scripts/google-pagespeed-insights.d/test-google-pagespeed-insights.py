@@ -88,7 +88,8 @@ def field_experience(**overrides):
             ]},
         },
         "overall_category": "AVERAGE",
-        "origin_fallback": False,
+        # origin_fallback is deliberately absent: Google omits the field unless it is true, so the
+        # common shape must be the one the fixtures exercise by default.
     }
     experience.update(overrides)
     return experience
@@ -109,7 +110,8 @@ def with_field_data(url=None, origin=None, **lighthouse_extra):
 def analyze_args(**overrides):
     # field_data mirrors the real default so a test must opt in exactly as a caller would.
     defaults = dict(profile="example", url="https://example.test/", strategy="mobile",
-                    category=["performance"], audit_limit=10, json=True, field_data="none")
+                    category=["performance"], audit_limit=10, json=True, field_data="none",
+                    field_limit=100)
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
 
@@ -122,7 +124,7 @@ GOLDEN_PAYLOAD = {
                                                         {"min": 0, "max": 2500, "proportion": 0.7231},
                                                         {"min": 2500, "max": 4000, "proportion": 0.19},
                                                         {"min": 4000, "proportion": 0.0869}]}},
-        "overall_category": "AVERAGE", "origin_fallback": False},
+        "overall_category": "AVERAGE"},
     "originLoadingExperience": {
         "id": "https://www.example.test",
         "metrics": {"CUMULATIVE_LAYOUT_SHIFT_SCORE": {"percentile": 10, "category": "AVERAGE"}},
@@ -187,15 +189,21 @@ class PageSpeedTest(unittest.TestCase):
             code = self.module.main(argv)
         return code, output.getvalue(), error.getvalue()
 
-    def assertFieldRefused(self, extra, expected):
+    def assertFieldRefused(self, extra, expected, field_data="distributions"):
+        """A refused optional section is reported and costs the exit status, never the lab rows."""
         payload = with_field_data()
         payload.update(extra)
         with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
             self.module, "request_json", return_value=payload
-        ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
-            with self.assertRaisesRegex(self.module.PageSpeedError, expected):
-                self.module.cmd_analyze(analyze_args(field_data="distributions"))
-        self.assertEqual("", output.getvalue())
+        ), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+            code = self.module.cmd_analyze(analyze_args(field_data=field_data))
+        self.assertEqual(2, code)
+        self.assertRegex(error.getvalue(), expected)
+        self.assertTrue(error.getvalue().startswith("ERROR: "), error.getvalue())
+        rows = json.loads(output.getvalue())
+        self.assertEqual([50], [row["score"] for row in rows if row["row_type"] == "summary"])
+        self.assertEqual([], [row for row in rows if row["row_type"].startswith("field_")])
+        return output.getvalue(), error.getvalue()
 
     def test_profiles_discovers_named_profile_without_network(self):
         with patch.dict(os.environ, self.env, clear=True), patch.object(
@@ -239,7 +247,7 @@ class PageSpeedTest(unittest.TestCase):
         self.assertNotIn("secret-key", str(raised.exception))
 
     def test_analyze_normalizes_scores_metrics_and_bounded_audits(self):
-        args = SimpleNamespace(profile="example", url="https://example.test/", strategy="mobile", category=["performance", "seo"], audit_limit=1, json=True, field_data="none")
+        args = analyze_args(category=["performance", "seo"], audit_limit=1)
         payload = {"lighthouseResult": {
             "requestedUrl": args.url, "finalUrl": "https://www.example.test/", "fetchTime": "2026-08-17T12:00:00Z", "lighthouseVersion": "13.0.0",
             "categories": {
@@ -269,7 +277,7 @@ class PageSpeedTest(unittest.TestCase):
         self.assertNotIn("secret-key", output.getvalue() + error.getvalue())
 
     def test_empty_lighthouse_result_is_refused(self):
-        args = SimpleNamespace(profile="example", url="https://example.test/", strategy="mobile", category=None, audit_limit=10, json=True, field_data="none")
+        args = analyze_args(category=None)
         with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(self.module, "request_json", return_value={}):
             with self.assertRaisesRegex(self.module.PageSpeedError, "no Lighthouse result"):
                 self.module.cmd_analyze(args)
@@ -298,11 +306,8 @@ class PageSpeedTest(unittest.TestCase):
         )
         for strategy, expected in self.module.STRATEGIES.items():
             with self.subTest(strategy=strategy):
-                args = SimpleNamespace(
-                    profile="example", url="https://example.test/", strategy=strategy,
-                    category=list(self.module.CATEGORIES), audit_limit=10, json=True,
-                    field_data="summary",
-                )
+                args = analyze_args(strategy=strategy, category=list(self.module.CATEGORIES),
+                                    field_data="summary")
                 with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
                     self.module, "request_json", return_value=lighthouse()
                 ) as request, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -321,10 +326,7 @@ class PageSpeedTest(unittest.TestCase):
         )
         self.assertEqual("desktop", parsed.strategy)
         self.assertEqual(["best-practices"], parsed.category)
-        args = SimpleNamespace(
-            profile="example", url="https://example.test/", strategy="desktop",
-            category=["best-practices"], audit_limit=10, json=True, field_data="none",
-        )
+        args = analyze_args(strategy="desktop", category=["best-practices"])
         with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
             self.module, "request_json",
             return_value=lighthouse(categories={"best-practices": {"score": 0.5, "auditRefs": []}}),
@@ -368,10 +370,7 @@ class PageSpeedTest(unittest.TestCase):
         )
         for payload, expected in cases:
             with self.subTest(expected=expected, payload=payload):
-                args = SimpleNamespace(
-                    profile="example", url="https://example.test/", strategy="mobile",
-                    category=["performance"], audit_limit=10, json=True, field_data="none",
-                )
+                args = analyze_args()
                 with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
                     self.module, "request_json", return_value=payload
                 ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -407,10 +406,7 @@ class PageSpeedTest(unittest.TestCase):
         )
         for payload, expected in cases:
             with self.subTest(expected=expected):
-                args = SimpleNamespace(
-                    profile="example", url="https://example.test/", strategy="mobile",
-                    category=["performance"], audit_limit=10, json=True, field_data="none",
-                )
+                args = analyze_args()
                 with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
                     self.module, "request_json", return_value=payload
                 ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -429,10 +425,7 @@ class PageSpeedTest(unittest.TestCase):
         with self.assertRaisesRegex(self.module.PageSpeedError, "non-finite value as JSON"):
             with redirect_stdout(io.StringIO()):
                 self.module.write_rows([{"score": NAN}], ["score"], True)
-        args = SimpleNamespace(
-            profile="example", url="https://example.test/", strategy="mobile",
-            category=["performance"], audit_limit=10, json=True, field_data="none",
-        )
+        args = analyze_args()
         payload = lighthouse(
             categories={"performance": {"score": 0.5, "auditRefs": [{"id": "a", "weight": 3}]}},
             audits={"a": {"score": 0.25, "title": "Fix a"},
@@ -526,8 +519,6 @@ class PageSpeedTest(unittest.TestCase):
                 overall_category="SLOW",
             ),
         )
-        # An origin object carries no origin_fallback field; only a page request can fall back.
-        del payload["originLoadingExperience"]["origin_fallback"]
         rows, error = self.field_of(payload, field_data="summary")
         summaries = [row for row in rows if row["row_type"] == "field_summary"]
         self.assertEqual([("url", "url"), ("origin", "origin")],
@@ -535,7 +526,8 @@ class PageSpeedTest(unittest.TestCase):
         self.assertEqual(["https://www.example.test/", "https://www.example.test"],
                          [row["field_id"] for row in summaries])
         self.assertEqual(["AVERAGE", "SLOW"], [row["field_category"] for row in summaries])
-        self.assertEqual(["false", ""], [row["origin_fallback"] for row in summaries])
+        # Neither object reported the flag, and neither reading is a fallback.
+        self.assertEqual(["false", "false"], [row["origin_fallback"] for row in summaries])
         page = [row for row in rows
                 if row["row_type"] == "field_metric" and row["requested_scope"] == "url"]
         self.assertEqual(["largest_contentful_paint", "cumulative_layout_shift_score_raw",
@@ -557,12 +549,82 @@ class PageSpeedTest(unittest.TestCase):
         self.assertEqual({"field_summary", "field_metric", "field_distribution"},
                          {row["row_type"] for row in rows})
 
+    def test_absent_origin_fallback_reads_as_a_page_level_reading(self):
+        """Google omits origin_fallback in the common case; absent must mean "not a fallback"."""
+        payload = with_field_data(url=field_experience(), origin=field_experience(
+            id="https://www.example.test", overall_category="SLOW"))
+        self.assertNotIn("origin_fallback", payload["loadingExperience"])
+        self.assertNotIn("origin_fallback", payload["originLoadingExperience"])
+        rows, _ = self.field_of(payload, field_data="summary")
+        self.assertTrue(rows)
+        self.assertEqual({"false"}, {row["origin_fallback"] for row in rows})
+        page = [row for row in rows if row["requested_scope"] == "url"]
+        self.assertTrue(page)
+        # An absent flag must not quietly reattribute the page's data to the whole origin.
+        self.assertEqual({"url"}, {row["effective_scope"] for row in page})
+
+    def test_absent_and_explicit_false_origin_fallback_are_reported_alike(self):
+        absent, _ = self.field_of(with_field_data(url=field_experience()), field_data="summary")
+        explicit, _ = self.field_of(
+            with_field_data(url=field_experience(origin_fallback=False)), field_data="summary")
+        # Both mean the same thing, so one spelling reaches the reader.
+        self.assertEqual(absent, explicit)
+        self.assertEqual({"false"}, {row["origin_fallback"] for row in absent})
+
+    def test_absent_origin_fallback_stays_distinguishable_from_a_malformed_one(self):
+        # Absent is a value the parser returns; malformed is a response the parser refuses.
+        self.assertIsNone(self.module.optional_flag({}, "origin_fallback", "url field origin fallback"))
+        self.assertIs(False, self.module.optional_flag(
+            {"origin_fallback": False}, "origin_fallback", "url field origin fallback"))
+        self.assertIs(True, self.module.optional_flag(
+            {"origin_fallback": True}, "origin_fallback", "url field origin fallback"))
+        for value in ("true", 1, 0, [], {}):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(self.module.PageSpeedError, "malformed url field origin fallback"):
+                    self.module.optional_flag({"origin_fallback": value}, "origin_fallback",
+                                              "url field origin fallback")
+        self.assertEqual(("false", "false", "true"),
+                         tuple(self.module.fallback_text(value) for value in (None, False, True)))
+
+    def test_an_explicit_null_origin_fallback_is_malformed_rather_than_absent(self):
+        """Google omits the field; a literal null is a payload that answered, badly.
+
+        Read as absent, this reports a confident `false` — the reading nobody would think to
+        question — from a response that never actually said so.
+        """
+        with self.assertRaisesRegex(self.module.PageSpeedError,
+                                    "malformed url field origin fallback"):
+            self.module.optional_flag({"origin_fallback": None}, "origin_fallback",
+                                      "url field origin fallback")
+        # Absent stays absent: the key not being there is still the ordinary case.
+        self.assertIsNone(self.module.optional_flag({"other": 1}, "origin_fallback",
+                                                    "url field origin fallback"))
+
+    def test_an_origin_scope_may_not_report_an_origin_fallback(self):
+        """Origin data cannot be a fallback from itself, and Google never says it is."""
+        common = {"requested_url": "https://www.example.test/", "final_url":
+                  "https://www.example.test/", "strategy": "mobile", "profile": "default"}
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                experience = field_experience(origin_fallback=value)
+                with self.assertRaisesRegex(self.module.PageSpeedError,
+                                            "origin fallback on origin field data"):
+                    self.module.scope_rows(experience, "origin", common, distributions=False)
+        # The page-level scope is where the flag belongs, and it still works there.
+        rows = self.module.scope_rows(field_experience(origin_fallback=True), "url", common,
+                                      distributions=False)
+        self.assertEqual("true", rows[0]["origin_fallback"])
+        self.assertEqual("origin", rows[0]["effective_scope"])
+        # And an origin scope with no flag at all is the ordinary, accepted case.
+        rows = self.module.scope_rows(field_experience(), "origin", common, distributions=False)
+        self.assertEqual("false", rows[0]["origin_fallback"])
+        self.assertEqual("origin", rows[0]["effective_scope"])
+
     def test_effective_scope_alone_cannot_classify_fallback_as_page_level(self):
         payload = with_field_data(
             url=field_experience(id="https://www.example.test", origin_fallback=True),
             origin=field_experience(id="https://www.example.test", overall_category="SLOW"),
         )
-        del payload["originLoadingExperience"]["origin_fallback"]
         rows, _ = self.field_of(payload, field_data="summary")
         # Reading effective_scope alone must never yield page-level data that is really site-wide.
         self.assertEqual([], [row for row in rows if row["effective_scope"] == "url"])
@@ -573,7 +635,7 @@ class PageSpeedTest(unittest.TestCase):
         genuine = [row for row in rows if row["requested_scope"] == "origin"]
         self.assertTrue(fallback and genuine)
         self.assertEqual({"true"}, {row["origin_fallback"] for row in fallback})
-        self.assertEqual({""}, {row["origin_fallback"] for row in genuine})
+        self.assertEqual({"false"}, {row["origin_fallback"] for row in genuine})
 
     def test_raw_metric_key_and_unit_travel_with_every_field_row(self):
         payload = with_field_data(url=field_experience(metrics={
@@ -680,6 +742,63 @@ class PageSpeedTest(unittest.TestCase):
                                                 {"min": 4000, "proportion": 0.08}]}}))
         rows, _ = self.field_of(payload, field_data="distributions")
         self.assertEqual(3, len([row for row in rows if row["row_type"] == "field_distribution"]))
+
+    def test_field_rows_are_bounded_by_default_with_an_explicit_truncation_notice(self):
+        payload = with_field_data(url=field_experience(), origin=field_experience(
+            id="https://www.example.test", overall_category="SLOW"))
+        code, emitted, error = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/",
+             "--field-data", "distributions", "--field-limit", "5", "--json"], payload)
+        rows = [row for row in json.loads(emitted) if row["row_type"].startswith("field_")]
+        self.assertEqual(5, len(rows))
+        self.assertIn("WARNING: field output truncated to 5 rows.", error)
+        # Truncation is a bound that was honoured, not requested work that did not happen.
+        self.assertEqual(0, code)
+        # Rows are dropped from the end, so the requested page's scope survives a small bound.
+        self.assertEqual({"url"}, {row["requested_scope"] for row in rows})
+
+    def test_field_limit_zero_reports_no_field_row_and_says_so(self):
+        payload = with_field_data(url=field_experience())
+        code, emitted, error = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/",
+             "--field-data", "summary", "--field-limit", "0", "--json"], payload)
+        self.assertEqual(0, code)
+        self.assertEqual([], [row for row in json.loads(emitted) if row["row_type"].startswith("field_")])
+        self.assertIn("WARNING: field output truncated to 0 rows.", error)
+        # Data that was dropped by the bound is not data Google failed to return.
+        self.assertNotIn("no Chrome UX Report field data", error)
+
+    def test_default_field_limit_holds_a_complete_current_response(self):
+        self.assertEqual(100, self.module.FIELD_LIMIT_DEFAULT)
+        self.assertEqual(500, self.module.FIELD_LIMIT_MAXIMUM)
+        self.assertEqual(100, self.module.parser().parse_args(
+            ["analyze", "--url", "https://example.test/"]).field_limit)
+        every_metric = {key: {"percentile": 1, "category": "FAST", "distributions": [
+            {"min": 0, "max": 10, "proportion": 0.5}, {"min": 10, "proportion": 0.5}]}
+            for key in self.module.FIELD_METRICS}
+        payload = with_field_data(url=field_experience(metrics=every_metric),
+                                  origin=field_experience(metrics=every_metric,
+                                                          id="https://www.example.test"))
+        code, emitted, error = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/",
+             "--field-data", "distributions", "--json"], payload)
+        self.assertEqual(0, code)
+        self.assertEqual(2 * (1 + len(self.module.FIELD_METRICS) * 3),
+                         len([row for row in json.loads(emitted)
+                              if row["row_type"].startswith("field_")]))
+        self.assertNotIn("truncated", error)
+
+    def test_main_rejects_an_unbounded_field_limit_before_network(self):
+        for value in ("501", "-1"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, self.env, clear=True), patch.object(
+                    self.module.urllib.request, "urlopen", side_effect=AssertionError("network")
+                ), redirect_stderr(io.StringIO()) as error:
+                    code = self.module.main([
+                        "analyze", "--profile", "example", "--url", "https://example.test/",
+                        "--field-data", "summary", "--field-limit", value])
+                self.assertEqual(2, code)
+                self.assertIn("--field-limit must be between 0 and 500", error.getvalue())
 
     def test_unrecognized_field_metric_is_passed_through_lowercased(self):
         # The v5 reference documents the metrics map key only as `(key)`, so a new metric must not
@@ -860,26 +979,57 @@ class PageSpeedTest(unittest.TestCase):
                 self.assertFieldRefused(extra, expected)
 
     def test_field_validation_does_not_depend_on_the_output_mode(self):
-        payload = with_field_data(url=field_experience(metrics={
-            "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2400, "distributions": [{"proportion": "most"}]}}))
+        extra = {"loadingExperience": {"metrics": {
+            "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2400,
+                                            "distributions": [{"proportion": "most"}]}}}}
         for mode in ("summary", "distributions"):
             with self.subTest(mode=mode):
-                with patch.object(self.module, "selected_profile", return_value=self.profile), patch.object(
-                    self.module, "request_json", return_value=payload
-                ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                    with self.assertRaisesRegex(self.module.PageSpeedError, "field distribution proportion"):
-                        self.module.cmd_analyze(analyze_args(field_data=mode))
+                self.assertFieldRefused(extra, "field distribution proportion", field_data=mode)
 
-    def test_malformed_field_data_exits_two_without_a_traceback(self):
-        payload = with_field_data()
+    def test_malformed_field_data_keeps_the_valid_lab_output_and_exits_two(self):
+        """The optional section is what failed, so the lab assessment must still reach stdout."""
+        payload = dict(GOLDEN_PAYLOAD)
         payload["loadingExperience"] = []
         code, emitted, error = self.run_main(
             ["analyze", "--profile", "example", "--url", "https://example.test/",
-             "--field-data", "summary"], payload)
+             "--field-data", "summary", "--json"], payload)
+        # Requested work did not happen, so the status is non-zero even though output was produced.
         self.assertEqual(2, code)
-        self.assertEqual("", emitted)
+        rows = json.loads(emitted)
+        self.assertEqual(["summary", "metric", "audit"], [row["row_type"] for row in rows])
+        self.assertEqual(82, rows[0]["score"])
+        self.assertEqual([], [row for row in rows if row["row_type"].startswith("field_")])
         self.assertTrue(error.startswith("ERROR: "), error)
+        self.assertIn("field data was not reported", error)
+        self.assertIn("malformed url field data", error)
         self.assertNotIn("Traceback", error)
+
+    def test_malformed_field_data_keeps_the_default_text_lab_output(self):
+        payload = dict(GOLDEN_PAYLOAD)
+        payload["loadingExperience"] = {"metrics": {
+            "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": "fast"}}}
+        code, emitted, error = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/",
+             "--field-data", "distributions"], payload)
+        self.assertEqual(2, code)
+        # Every lab row the caller asked for is present; only the field columns stay empty.
+        self.assertEqual(4, len(emitted.splitlines()))
+        self.assertIn("summary,performance", emitted)
+        self.assertNotIn("field_summary", emitted)
+        self.assertIn("field metric percentile", error)
+
+    def test_a_refused_optional_section_never_suppresses_a_lab_finding(self):
+        """The audit rows are the reason the command was run; they must survive a field refusal."""
+        payload = dict(GOLDEN_PAYLOAD)
+        payload["loadingExperience"] = {"overall_category": "EXCELLENT"}
+        clean, _ = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/", "--json"],
+            GOLDEN_PAYLOAD)[1:]
+        code, emitted, _ = self.run_main(
+            ["analyze", "--profile", "example", "--url", "https://example.test/",
+             "--field-data", "summary", "--json"], payload)
+        self.assertEqual(2, code)
+        self.assertEqual(json.loads(clean), json.loads(emitted))
 
     def test_field_metric_names_and_units_match_the_documented_response_keys(self):
         # Key strings come from Google's own examples and release notes; see references/cli.md.
