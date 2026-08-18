@@ -64,8 +64,8 @@ in their owning package instead of turning the lexicon into a field inventory.
   sitemaps, URL inspection, and confirmation-guarded sitemap submission.
 - `google-analytics` — accessible GA4 accounts and properties, bounded traffic, audience, key-event,
   and ecommerce reports, plus direct Analytics Data API queries.
-- `google-pagespeed-insights` — bounded Lighthouse scores, lab metrics, and prioritized audit
-  findings for public webpages.
+- `google-pagespeed-insights` — bounded Lighthouse scores, lab metrics, prioritized audit
+  findings, and opt-in Chrome UX Report field data for public webpages.
 - `google-merchant` — Merchant Center accounts, product serving status, item-issue diagnostics,
   bounded product performance reports, and Google's price and market insights.
 
