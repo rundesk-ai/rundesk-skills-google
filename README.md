@@ -4,8 +4,9 @@ Guarded Google service integrations packaged as reusable Agent Skills with self-
 runtimes and offline tests. Rundesk discovers packages under `skills/`; `manifest.json` is the
 catalog index.
 
-The initial catalog is read-only. It separates Search Console from Google Analytics so each skill
-can request only the OAuth access and Google resources it needs.
+The catalog is read-only apart from Search Console's confirmation-guarded sitemap submission. It
+separates Search Console from Google Analytics so each skill can request only the OAuth access and
+Google resources it needs.
 
 ## Install with Rundesk CLI
 
@@ -54,8 +55,8 @@ in their owning package instead of turning the lexicon into a field inventory.
 
 ## Included skills
 
-- `google-search-console` — accessible sites, bounded search performance reports, sitemaps, and URL
-  inspection.
+- `google-search-console` — accessible sites, bounded and filterable search performance reports,
+  sitemaps, URL inspection, and confirmation-guarded sitemap submission.
 - `google-analytics` — accessible GA4 accounts and properties plus bounded Analytics Data API
   reports.
 - `google-pagespeed-insights` — bounded Lighthouse scores, lab metrics, and prioritized audit
