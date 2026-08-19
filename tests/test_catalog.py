@@ -1,6 +1,7 @@
 """Catalog structure and package contracts, verified entirely offline."""
 
 import hashlib
+import ast
 import json
 import os
 import re
@@ -11,8 +12,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_SKILLS = {"google-analytics", "google-merchant", "google-pagespeed-insights",
-                   "google-search-console"}
+EXPECTED_SKILLS = {"google-analytics", "google-auth", "google-merchant",
+                   "google-pagespeed-insights", "google-search-console"}
+
+#: Which packages still declare owner-supplied values, and which no longer can. A package that
+#: signs in through Rundesk's broker declares nothing: its client and its grant are Rundesk's, and
+#: a `rundesk.json` naming them would be the second place a credential lived.
+DECLARING = {"google-pagespeed-insights"}
 ALLOWED_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 DECLARED_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 CATALOG_GUIDE = "https://github.com/rundesk-ai/rundesk-cli/blob/main/docs/catalogs.md"
@@ -229,7 +235,17 @@ class GoogleCatalog(unittest.TestCase):
         for entry in self.manifest["skills"]:
             with self.subTest(skill=entry["name"]):
                 package = ROOT / entry["path"]
-                declaration = json.loads((package / "rundesk.json").read_text(encoding="utf-8"))
+                declared = package / "rundesk.json"
+                if entry["name"] not in DECLARING:
+                    # A brokered package declares nothing at all. Left behind, its old client and
+                    # refresh-token names would still be prompted for by `rundesk skills configure`
+                    # and still reported missing by `doctor` — an owner told to place credentials
+                    # that nothing reads any more.
+                    self.assertFalse(declared.exists(),
+                                     f"{entry['name']} signs in through Rundesk and must declare "
+                                     "no credentials of its own")
+                    continue
+                declaration = json.loads(declared.read_text(encoding="utf-8"))
                 self.assertEqual(["needs"], list(declaration))
                 self.assertTrue(declaration["needs"])
                 prefix = entry["name"].upper().replace("-", "_")
@@ -240,6 +256,30 @@ class GoogleCatalog(unittest.TestCase):
                     self.assertIsInstance(reason, str)
                     self.assertGreater(len(reason), 40)
                     self.assertNotIn(name, reason)
+
+    def test_no_package_carries_its_own_oauth_client_or_grant(self):
+        """The migration has one direction, and a leftover is worse than a clean break.
+
+        Each of these named one Google identity's whole grant, per package. They are replaced by
+        Rundesk holding the grant once; a package that still declared one would be asking an owner
+        to configure a second, unread copy of the credential this catalog no longer touches.
+        """
+        gone = ("_CLIENT_ID", "_CLIENT_SECRET", "_REFRESH_TOKEN")
+        for entry in self.manifest["skills"]:
+            package = ROOT / entry["path"]
+            for one in sorted(package.rglob("*")):
+                # Shipped runtime and documentation only. A suite may legitimately *name* one of
+                # these to prove it is not read and not leaked, and a rule that forbade the name
+                # everywhere would forbid exactly the test that proves the rule.
+                if one.name.startswith("test-"):
+                    continue
+                if one.is_file() and one.suffix in (".py", ".json", ".md"):
+                    said = one.read_text(encoding="utf-8", errors="replace")
+                    for name in gone:
+                        with self.subTest(file=str(one.relative_to(ROOT)), name=name):
+                            self.assertNotIn(f"GOOGLE_ANALYTICS{name}", said)
+                            self.assertNotIn(f"GOOGLE_MERCHANT{name}", said)
+                            self.assertNotIn(f"GOOGLE_SEARCH_CONSOLE{name}", said)
 
     def test_launchers_and_scripts_are_executable(self):
         for entry in self.manifest["skills"]:
@@ -287,6 +327,114 @@ class GoogleCatalog(unittest.TestCase):
                 with self.subTest(path=path.relative_to(ROOT)):
                     text = path.read_text(encoding="utf-8", errors="ignore")
                     self.assertFalse(any(value.lower() in text.lower() for value in forbidden))
+
+
+class GoogleSignInGuidance(unittest.TestCase):
+    """What the setup documentation must say, because getting it wrong is the usual failure."""
+
+    OAUTH_PACKAGES = ("google-analytics", "google-search-console", "google-merchant")
+
+    def reference(self):
+        return (ROOT / "skills" / "google-auth" / "references" / "cli.md").read_text(
+            encoding="utf-8")
+
+    def test_the_owner_places_the_app_client_before_signing_in(self):
+        said = self.reference()
+        compact = " ".join(said.split())
+        self.assertIn("rundesk env set GOOGLE_OAUTH_CLIENT_ID", said)
+        self.assertIn("rundesk env set GOOGLE_OAUTH_CLIENT_SECRET", said)
+        # Placed first, then signed in. Read inside the one step that gives the commands, because
+        # `login` is legitimately named earlier in prose and anchoring on the whole page would make
+        # this assert layout rather than instruction.
+        step = said[said.index("5. Place the client values"):]
+        step = step[:step.index("```", step.index("```") + 3)]
+        self.assertLess(step.index("rundesk env set GOOGLE_OAUTH_CLIENT_ID"),
+                        step.index("rundesk login google"))
+        self.assertLess(step.index("rundesk env set GOOGLE_OAUTH_CLIENT_SECRET"),
+                        step.index("rundesk login google"))
+        self.assertIn("asks for nothing", compact)
+
+    def test_no_google_package_ever_asks_anyone_for_a_credential(self):
+        for name in ("google-auth", *self.OAUTH_PACKAGES):
+            said = " ".join((ROOT / "skills" / name / "SKILL.md").read_text(
+                encoding="utf-8").split())
+            with self.subTest(package=name):
+                self.assertIn("Never ask anyone for a client ID", said)
+                self.assertIn("refresh token", said)
+
+    def test_the_desktop_client_and_its_loopback_callback_are_documented(self):
+        compact = " ".join(self.reference().split())
+        for said in ("Desktop app", "127.0.0.1", "<ephemeral-port>", "<random-path>",
+                     "No fixed port", "not `localhost`",
+                     "No manual copy-and-paste", "return to the terminal"):
+            with self.subTest(said=said):
+                self.assertIn(said, compact)
+
+    def test_api_enablement_consent_scopes_and_resource_access_are_told_apart(self):
+        compact = " ".join(self.reference().split())
+        for said in ("API enablement", "OAuth consent scopes", "Resource permission",
+                     "Account selection", "Google Analytics Data API",
+                     "Google Analytics Admin API", "Search Console API", "Merchant API",
+                     "must already have access to the Analytics properties"):
+            with self.subTest(said=said):
+                self.assertIn(said, compact)
+
+    def test_the_webmasters_scope_says_why_it_is_not_the_readonly_one(self):
+        compact = " ".join(self.reference().split())
+        self.assertIn("auth/webmasters", compact)
+        self.assertIn("sitemap submission mutates", compact)
+        self.assertIn("analytics.readonly", compact)
+        self.assertIn("auth/content", compact)
+
+    def test_no_skill_leads_a_reader_to_type_a_profile(self):
+        """The default app is the whole mental model; `--profile` is a marked escape hatch.
+
+        Checked on the command examples rather than on the prose, because an example is what gets
+        copied — a guide can say "rarely needed" and still teach the opposite in its code block.
+        """
+        for name in ("google-auth", *self.OAUTH_PACKAGES):
+            said = (ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
+            with self.subTest(package=name):
+                examples = [one for one in said.splitlines()
+                            if one.lstrip().startswith(('"$RUNDESK_SKILLS', "  --", "rundesk "))]
+                self.assertTrue(examples)
+                for one in examples:
+                    self.assertNotIn("--profile", one)
+                self.assertIn("--email", said)
+                self.assertIn("almost never right", " ".join(said.split()))
+
+
+class NoShadowedDefinition(unittest.TestCase):
+    """A name defined twice in one scope is the second one winning, silently.
+
+    Python does not complain, the suite still reports the same count, and the first definition is
+    simply never run — so a case somebody wrote and believes is covering something is dead code
+    that goes on passing. This was a real edit here: two rounds of the same insertion left one
+    class holding two `gone`, two `stop_orphan`, and two tests of one name, and nothing went red.
+    """
+
+    def python_files(self):
+        for one in sorted(ROOT.rglob("*.py")):
+            if ".git" not in one.parts:
+                yield one
+
+    def test_no_module_or_class_defines_one_name_twice(self):
+        shadowed = []
+        for one in self.python_files():
+            tree = ast.parse(one.read_text(encoding="utf-8"), filename=str(one))
+            for scope in [tree] + [node for node in ast.walk(tree)
+                                   if isinstance(node, ast.ClassDef)]:
+                seen = {}
+                for node in scope.body:
+                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                             ast.ClassDef)):
+                        continue
+                    if node.name in seen:
+                        where = getattr(scope, "name", one.stem)
+                        shadowed.append(f"{one.relative_to(ROOT)}: {where}.{node.name} "
+                                        f"at lines {seen[node.name]} and {node.lineno}")
+                    seen[node.name] = node.lineno
+        self.assertEqual([], shadowed, "a later definition silently replaces an earlier one")
 
 
 if __name__ == "__main__":

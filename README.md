@@ -6,6 +6,8 @@ confirmation-guarded sitemap submission.
 
 ## Skills
 
+- `google-auth` - the catalog's Google provider declaration, plus connecting, listing, and
+  choosing the Google accounts Rundesk holds.
 - `google-analytics` - accessible GA4 accounts and properties, bounded traffic, audience, key-event,
   ecommerce, and direct Analytics Data API reports.
 - `google-merchant` - Merchant Center accounts, product serving status, item issues, bounded product
@@ -51,14 +53,43 @@ scopes, and resource discovery sequence.
 
 - Python 3.9+ and the standard library. No package manager, virtual environment, shared Google
   runtime, or sibling-package dependency is required.
-- The Google API and OAuth configuration declared by the chosen package's `rundesk.json`. PageSpeed
-  uses its documented API credential contract; other packages use their documented OAuth clients and
-  grants. Never put secret values or grants in the catalog.
-- Explicit profile and resource selection when more than one Google identity, account, property,
-  site, or resource is available.
+- A Google account connected through Rundesk for Analytics, Search Console, and Merchant. Rundesk
+  owns the browser flow, keeps the grant sealed, and refreshes tokens; a package declares no
+  credentials and receives one short-lived access token over a private socket when it runs. Never
+  put a secret value or a grant in the catalog.
+- PageSpeed is the exception: it reads public pages with a Google Cloud API key declared in its own
+  `rundesk.json`, and signs nobody in.
+- Explicit account and resource selection when more than one Google account, property, site, or
+  Merchant account is available.
 
-Read [ENVIRONMENTS.md](ENVIRONMENTS.md) for OAuth profile resolution, configuration ownership,
-credential-file permissions, cache, and state. Read the [Google integration lexicon](docs/lexicon.md)
+### Signing in
+
+What Google *is* — its endpoints, identity fields, base scopes, and one scope per capability — is
+declared by the `google-auth` package in this catalog, in `oauth-provider.json` beside its
+`SKILL.md`. Rundesk supplies the mechanics and reads that declaration; no package here carries OAuth
+code.
+
+```sh
+rundesk env set GOOGLE_OAUTH_CLIENT_ID
+rundesk env set GOOGLE_OAUTH_CLIENT_SECRET
+rundesk login google
+```
+
+The owner places the OAuth app client with the ordinary `rundesk env set`, typed rather than passed
+as an argument, and signs in once. Rundesk seals both values and withholds them from every agent
+turn, so a package cannot read them; `rundesk login google` uses what is already placed and prompts
+only for something genuinely missing.
+
+One OAuth app holds as many verified Google accounts as you sign in with. A command takes `--email
+<address>` to choose the account and `--auth` to run `rundesk login google` first, each needed only
+when more than one answer exists; ambiguity is refused rather than guessed. An installation with two
+Google Cloud OAuth apps — uncommon — can add `--profile <app-profile>`, which selects the app and
+never the person.
+
+See [`skills/google-auth/references/cli.md`](skills/google-auth/references/cli.md) for the Google
+Cloud project, API enablement, consent-scope, and Desktop-client setup.
+
+Read [ENVIRONMENTS.md](ENVIRONMENTS.md) for OAuth ownership, configuration, cache, and state. Read the [Google integration lexicon](docs/lexicon.md)
 for canonical product and resource terminology.
 
 ## Repository layout
