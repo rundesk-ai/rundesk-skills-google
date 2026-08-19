@@ -5,7 +5,7 @@
   "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
   "token_endpoint": "https://oauth2.googleapis.com/token",
   "identity_endpoint": "https://openidconnect.googleapis.com/v1/userinfo",
-  "base_scopes": ["openid", "email"],
+  "base_scopes": ["openid", "https://www.googleapis.com/auth/userinfo.email"],
   "identity": {
     "subject": "sub",
     "email": "email",

@@ -70,7 +70,8 @@ class DeclarationTest(unittest.TestCase):
 
     def test_base_scopes_are_unique_non_empty_and_minimal(self):
         scopes = self.declared["base_scopes"]
-        self.assertEqual(["openid", "email"], scopes)
+        self.assertEqual(
+            ["openid", "https://www.googleapis.com/auth/userinfo.email"], scopes)
         self.assertEqual(len(scopes), len(set(scopes)))
         self.assertTrue(all(isinstance(one, str) and one.strip() for one in scopes))
 

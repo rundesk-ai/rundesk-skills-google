@@ -28,7 +28,7 @@ store — and reads Google's particulars from `oauth-provider.json`:
 | `token_endpoint` | `https://oauth2.googleapis.com/token` |
 | `identity_endpoint` | `https://openidconnect.googleapis.com/v1/userinfo` |
 | `identity` | `sub` is the durable account key; `email` is the human selector; `email_verified` must be true |
-| `base_scopes` | `openid`, `email` |
+| `base_scopes` | `openid`, `https://www.googleapis.com/auth/userinfo.email` |
 | `authorization_parameters` | `access_type=offline` for a refresh token, `prompt=consent select_account` so the account is chosen deliberately |
 | `client_secret` | `true`: Google issues one even for a desktop client |
 | `capabilities` | `analytics`, `search-console`, and `merchant`, each naming one Google scope |
@@ -64,7 +64,8 @@ that person, never above them.
 2. Configure Google Auth Platform branding and audience. Internal suits a single eligible Workspace
    organization; otherwise choose External and add every intended account as a test user while the
    app is in Testing.
-3. Under Data Access, declare `openid` and `email` — which is how Rundesk establishes a verified,
+3. Under Data Access, declare `openid` and `https://www.googleapis.com/auth/userinfo.email` — which
+   is how Rundesk establishes a verified,
    durable account identity — plus only the capability scopes this installation needs:
 
    | Capability | Scope | Why this one |
@@ -73,7 +74,8 @@ that person, never above them.
    | `search-console` | `https://www.googleapis.com/auth/webmasters` | **not** the `.readonly` variant, because sitemap submission mutates; the read-only scope cannot submit one |
    | `merchant` | `https://www.googleapis.com/auth/content` | Google publishes exactly one Merchant API scope and it is read-write |
 
-   Rundesk asks for `openid` and `email` at sign-in and adds one capability scope only when a
+   Rundesk asks for `openid` and Google's canonical `userinfo.email` scope at sign-in and adds one
+   capability scope only when a
    command first needs it, so an installation that never runs Merchant never consents to `content`.
 
 4. Under Clients, create an OAuth client whose application type is **Desktop app**. Do not create a
