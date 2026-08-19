@@ -1,23 +1,36 @@
 ---
 name: google-analytics
-description: Use when the user needs to inspect Google Analytics 4 accounts or properties; understand where site traffic and sessions come from; break traffic down by channel, source, campaign, landing page, geography, device, or aggregated age and gender; measure leads and other key events; review ecommerce product, purchase, and revenue behavior; or run a bounded historical or realtime GA4 metric query. It supplies read-only GA4 discovery and reporting through explicitly selected credential profiles and properties. Do not use for Universal Analytics, tag or ecommerce implementation, Google Ads, Merchant Center product feeds, Search Console, Analytics Admin change history, or Analytics configuration changes.
+description: Use when the user needs to inspect Google Analytics 4 accounts or properties; understand where site traffic and sessions come from; break traffic down by channel, source, campaign, landing page, geography, device, or aggregated age and gender; measure leads and other key events; review ecommerce product, purchase, and revenue behavior; or run a bounded historical or realtime GA4 metric query. It supplies read-only GA4 discovery and reporting through an explicitly selected Google account and property. Do not use for Universal Analytics, tag or ecommerce implementation, Google Ads, Merchant Center product feeds, Search Console, Analytics Admin change history, or Analytics configuration changes.
 ---
 
 # Google Analytics
 
-Run `$RUNDESK_SKILLS/google-analytics/scripts/google-analytics`; it resolves credentials itself, so
-never inspect or print their source. Read `references/cli.md` for setup, environment keys, report
-arguments, breakdown fields, output fields, or validation.
+Run `$RUNDESK_SKILLS/google-analytics/scripts/google-analytics`. Rundesk owns Google sign-in and
+hands the command one short-lived token, so never ask for or print a credential. Read
+`references/cli.md` for signing in, report arguments, breakdown fields, output fields, or validation.
 
-Start with `profiles`, then discover the accounts and properties visible to the selected identity:
+Start with `profiles`, which shows the accounts Rundesk holds and needs no network, then discover
+what the selected account can reach:
 
 ```sh
 "$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" profiles
-"$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" accounts --profile <profile> --limit 25
-"$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" properties --profile <profile> --limit 50
+"$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" accounts --email <address> --limit 25
+"$RUNDESK_SKILLS/google-analytics/scripts/google-analytics" properties --limit 50
 ```
 
-Never guess a profile or property. Use the exact numeric property ID returned by `properties`.
+`--email` names one signed-in Google account, and is needed only when Rundesk holds more than one;
+the refusal lists the connected addresses. When nothing is connected, the command says so and names
+the command to run. Ask the owner to run `rundesk login google` in their own terminal, or pass
+`--auth` to run that sign-in from here when a browser is available. The `google-auth` skill in this
+catalog owns sign-in, the list of connected accounts, and the Google Cloud setup.
+
+`--profile <app-profile>` exists and is almost never right: it selects a second OAuth **app**, for
+an installation with two Google Cloud projects. Do not add it to a command you construct, and never
+use it to choose an account — that is always `--email`. Never ask anyone for a client ID, a client
+secret, or a refresh token.
+
+Never guess an account or a property. Use the exact numeric property ID returned by
+`properties`.
 
 ## Answer the common questions with the bounded reports
 
@@ -43,7 +56,7 @@ google-analytics commerce --property <id> --breakdown item --purchased-only --li
   cart adds, checkouts, purchases, and item revenue; `date` and `channel` report purchases and
   purchase revenue. `--purchased-only` drops rows with no purchase in the window.
 
-Every one of these accepts `--start-date`, `--end-date`, `--limit`, `--profile`, and `--json`, and
+Every one of these accepts `--start-date`, `--end-date`, `--limit`, `--email`, and `--json`, and
 defaults to the last 28 days.
 
 Use `report` and `realtime` only when the question needs a field combination the four bounded

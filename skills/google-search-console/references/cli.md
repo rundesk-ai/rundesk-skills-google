@@ -26,6 +26,47 @@ which are passed to Google verbatim. Supported dimensions are `date`, `country`,
 `query`, and `searchAppearance`; repeat `--dimension` to group by more than one. Optional
 `--search-type` values are `web`, `image`, `video`, `news`, `discover`, and `googleNews`.
 
+## Signing in
+
+Rundesk owns Google sign-in. It runs the browser flow, keeps the grant sealed, and refreshes
+tokens. This package holds none of that and declares no credentials: it asks Rundesk for one
+short-lived access token over one end of a socket pair it creates itself, and uses that token as a
+request header only. The token never reaches an argument, an environment variable, a file, or any
+output.
+
+What `google` means — Google's endpoints, identity fields, base scopes, and the scope behind each
+capability — is declared by this catalog's `google-auth` package, which owns sign-in, the account
+listing, and the Google Cloud setup. This package reads nothing from it and never runs it.
+
+```sh
+rundesk login google
+rundesk login google --profile acme
+```
+
+A *profile* is one OAuth app configuration, not a person. A single profile can hold several verified
+Google accounts; Rundesk keys each by Google's immutable subject identifier and selects it by email.
+
+```text
+--profile <app-profile>   which OAuth app configuration to use; needed only when more than one exists
+--email <address>         which signed-in account to use; needed only when that profile holds several
+--auth                    run `rundesk login google` first, forwarding --profile, then continue
+```
+
+`profiles` lists the accounts Rundesk holds for one app profile and contacts Google for none of it.
+Missing sign-in, an unconfigured app profile, an ambiguous account, and a missing scope each name
+the exact command to run.
+
+Rundesk attaches this package's fixed scope to the token and widens consent in the browser itself
+when a grant is short:
+
+```text
+https://www.googleapis.com/auth/webmasters   every command, including submit-sitemap
+```
+
+A Rundesk older than the provider-neutral sign-in bridge cannot answer at all; the command says so
+and says to update Rundesk. There is no other way to authorize this package, and it declares no credentials of its own:
+there is no client ID, client secret, refresh token, dotenv, or `--env-file` to configure.
+
 ## Filtering performance
 
 `--filter DIMENSION:OPERATOR:EXPRESSION` is repeatable and adds Google's `dimensionFilterGroups` to
@@ -86,75 +127,6 @@ URL, and required scope, makes no network call at all, and exits 2. `--sitemap` 
 Google rejects it; a `sc-domain:` property covers every host it verifies, so no warning applies
 there.
 
-## Credentials and profiles
-
-The command uses OAuth 2.0 refresh credentials and requests access tokens from Google's token
-endpoint as needed. Create an OAuth client in a Google Cloud project with the Search Console API
-enabled, complete user authorization with the scope that profile needs, and store the resulting
-client ID, client secret, and refresh token through Rundesk. Never commit them.
-
-```text
-https://www.googleapis.com/auth/webmasters.readonly   profiles, sites, performance, inspect-url, sitemaps
-https://www.googleapis.com/auth/webmasters            everything above, plus submit-sitemap
-```
-
-A refresh token carries only the scopes it was granted, and Google does not widen an existing grant.
-A profile authorized for `webmasters.readonly` therefore fails `submit-sitemap --confirm` with HTTP
-403 until the owner reauthorizes for `https://www.googleapis.com/auth/webmasters` and stores the
-resulting new refresh token in place of the old one. Keep a profile on the read-only scope unless
-that Google account is meant to submit sitemaps.
-
-For the initial manual setup, create a web OAuth client with
-`https://developers.google.com/oauthplayground` as an authorized redirect URI. In Google's OAuth
-2.0 Playground, enable **Use your own OAuth credentials**, choose server-side and offline access,
-authorize the scope above as the intended Google user, and exchange the code for a refresh token.
-Enter the three values only through `rundesk skills configure` in the owner's terminal. Do not send
-them through chat or save a Playground link containing credentials or tokens.
-
-An external OAuth consent screen left in **Testing** normally issues refresh tokens that expire in
-seven days for these non-profile scopes. Publish the app appropriately or expect to reconnect after
-the testing token expires. Revocation, inactivity, Workspace policy, and Google's per-user token
-limits can also invalidate a refresh token.
-
-Required variables from `rundesk.json`:
-
-```text
-GOOGLE_SEARCH_CONSOLE_CLIENT_ID
-GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET
-GOOGLE_SEARCH_CONSOLE_REFRESH_TOKEN
-```
-
-Optional variables are `GOOGLE_SEARCH_CONSOLE_LABEL` and
-`GOOGLE_SEARCH_CONSOLE_DEFAULT_PROFILE`. A Rundesk-managed named profile appends a normalized
-double-underscore suffix:
-
-```dotenv
-GOOGLE_SEARCH_CONSOLE_CLIENT_ID__EXAMPLE=
-GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET__EXAMPLE=
-GOOGLE_SEARCH_CONSOLE_REFRESH_TOKEN__EXAMPLE=
-GOOGLE_SEARCH_CONSOLE_LABEL__EXAMPLE=Example Search Console
-```
-
-The command also preserves the local dotenv spelling:
-
-```dotenv
-GOOGLE_SEARCH_CONSOLE_PROFILES=example
-GOOGLE_SEARCH_CONSOLE_DEFAULT_PROFILE=example
-GOOGLE_SEARCH_CONSOLE_EXAMPLE_CLIENT_ID=
-GOOGLE_SEARCH_CONSOLE_EXAMPLE_CLIENT_SECRET=
-GOOGLE_SEARCH_CONSOLE_EXAMPLE_REFRESH_TOKEN=
-GOOGLE_SEARCH_CONSOLE_EXAMPLE_LABEL=Example Search Console
-```
-
-Resolution order is process environment, `--env-file`, `GOOGLE_SEARCH_CONSOLE_ENV_FILE`,
-`RUNDESK_INTEGRATIONS_ENV`, `${XDG_CONFIG_HOME:-$HOME/.config}/rundesk/integrations/google-search-console/env`,
-then the legacy `${XDG_CONFIG_HOME:-$HOME/.config}/google-search-console/env`. Within one profile,
-Rundesk's suffixed key wins, then the local infix key, then the plain key for the default profile
-only. A named profile never falls back to another account's plain credentials.
-
-`profiles` does not contact Google and never prints credential values. A service command requires
-an explicit profile when more than one is configured.
-
 ## Output
 
 - `sites`: property URL, permission level, profile.
@@ -168,8 +140,8 @@ an explicit profile when more than one is configured.
 - `submit-sitemap --confirm`: property plus the sitemap fields Google returned when the entry was
   read back, `submitted` state, profile.
 
-Errors and truncation warnings go to stderr. OAuth secrets, access tokens, authorization headers,
-and raw credential files are never printed.
+Errors and truncation warnings go to stderr. Access tokens and authorization headers are never
+printed.
 
 ## Validation
 
@@ -180,13 +152,13 @@ skills/google-search-console/scripts/google-search-console submit-sitemap --help
 skills/google-search-console/scripts/google-search-console profiles
 ```
 
-Tests are offline and replace the token and API network boundaries with synthetic responses.
+Tests are offline: a stand-in Rundesk answers the sign-in bridge exactly as the real one
+documents it, and synthetic responses stand in for Google.
 
 ## Official references
 
 - [Search Console API authorization](https://developers.google.com/webmaster-tools/v1/how-tos/authorizing)
 - [Google OAuth 2.0](https://developers.google.com/identity/protocols/oauth2)
-- [OAuth 2.0 Playground](https://developers.google.com/oauthplayground/)
 - [Sites: list](https://developers.google.com/webmaster-tools/v1/sites/list)
 - [Search Analytics: query](https://developers.google.com/webmaster-tools/v1/searchanalytics/query)
 - [URL Inspection: index.inspect](https://developers.google.com/webmaster-tools/v1/urlInspection.index/inspect)

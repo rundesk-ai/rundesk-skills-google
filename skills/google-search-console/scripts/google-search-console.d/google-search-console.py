@@ -10,32 +10,27 @@ import io
 import json
 import os
 import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zoneinfo
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable
 
 
-SKILL = "GOOGLE_SEARCH_CONSOLE"
-FIELDS = {
-    "GOOGLE_SEARCH_CONSOLE_CLIENT_ID": "CLIENT_ID",
-    "GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET": "CLIENT_SECRET",
-    "GOOGLE_SEARCH_CONSOLE_REFRESH_TOKEN": "REFRESH_TOKEN",
-    "GOOGLE_SEARCH_CONSOLE_LABEL": "LABEL",
-}
-REQUIRED = tuple(list(FIELDS)[:3])
-ACCOUNT_RE = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)*")
-TOKEN_URL = "https://oauth2.googleapis.com/token"
 WEBMASTERS_API = "https://www.googleapis.com/webmasters/v3"
 INSPECTION_API = "https://searchconsole.googleapis.com/v1"
 # Search Console buckets every row by Pacific day, so complete-day defaults must use that zone.
 PACIFIC_ZONE = "America/Los_Angeles"
-# sitemaps.submit is the only writing method in this package. A webmasters.readonly grant cannot
-# call it, and Google will not widen an existing refresh token, so the owner must reauthorize.
+# sitemaps.submit is the only writing method in this package, and it needs the full scope rather
+# than webmasters.readonly. Rundesk attaches this one to every token it grants here, so submission
+# is never a separate authorization step.
 SUBMIT_SCOPE = "https://www.googleapis.com/auth/webmasters"
 FILTER_DIMENSIONS = ("query", "page", "country", "device", "searchAppearance")
 FILTER_OPERATORS = ("contains", "equals", "notContains", "notEquals", "includingRegex", "excludingRegex")
@@ -49,15 +44,6 @@ MAX_EXPRESSION = 4096
 
 class SearchConsoleError(RuntimeError):
     pass
-
-
-@dataclass(frozen=True)
-class Profile:
-    name: str
-    client_id: str = field(repr=False)
-    client_secret: str = field(repr=False)
-    refresh_token: str = field(repr=False)
-    label: str
 
 
 class PacificFallback(dt.tzinfo):
@@ -107,156 +93,411 @@ def pacific_today() -> dt.date:
     return utc_now().astimezone(pacific_zone()).date()
 
 
-def env_candidates() -> list[Path]:
-    paths: list[Path] = []
-    for key in (f"{SKILL}_ENV_FILE", "RUNDESK_INTEGRATIONS_ENV"):
-        if os.environ.get(key):
-            paths.append(Path(os.environ[key]).expanduser())
-    xdg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")).expanduser()
-    paths.extend([
-        xdg / "rundesk" / "integrations" / "google-search-console" / "env",
-        xdg / "google-search-console" / "env",
-    ])
-    return paths
+# --- Rundesk-managed Google sign-in -------------------------------------------------------------
+#
+# Rundesk owns the OAuth client, the browser, the refresh token, and where those are kept. This
+# package owns none of it and asks the install's own CLI for one short-lived access token, which
+# arrives over one connected unnamed local socket held by nothing but these two processes rather
+# than through argv, the environment, stdout, or a file. The wire format is Rundesk's hidden
+# `_oauth` bridge, version 1. Rundesk refuses a pipe, a named socket, a regular file, and 0, 1, 2.
+COMMAND_VARIABLE = "RUNDESK_COMMAND"
+BRIDGE = "_oauth"
+# Which OAuth provider Rundesk signs in to. What that name means — Google's endpoints, identity
+# fields, and the scope each capability carries — is declared by this catalog's `google-auth`
+# package, which this one reads nothing from and never runs.
+PROVIDER = "google"
+# The capability this package asks for. Rundesk turns it into the scope the provider declares, so no
+# scope is chosen here.
+CAPABILITY = "search-console"
+BRIDGE_VERSION = 1
+MAX_FRAME = 65536
+# One bound for a whole child, not for each step of one: a request that spends its time reading a
+# frame has that much less left to be waited on. Rundesk gives a person 180 seconds at the browser
+# when a grant has to be widened, and its own calls to Google time out at 30, so this covers every
+# phase and still ends.
+BRIDGE_SECONDS = 300
+# `rundesk login google` waits on a person at the browser first and on Google afterwards, so its
+# bound is larger than the bridge's. It is still finite: a login nobody completes is stopped rather
+# than left holding this command open.
+SIGN_IN_SECONDS = 420
+# Rundesk's own words about signing in belong beside this command's other diagnostics, never in the
+# rows a caller parses.
+#: How long a stopped child and its group get to actually go. Bounded like everything else here:
+#: the point of this window is to end a wait, so it may not become one.
+STOP_SECONDS = 5.0
+
+#: How long an already-finished child's abandoned pipe is given to yield what it has. Short on
+#: purpose: reaching that path means something else is holding the pipe open, so this is a grace
+#: for bytes already in flight, never a wait for a writer nobody here owns.
+LINGER_SECONDS = 0.2
+
+#: The most partial output that is ever carried out of an abandoned pipe. A refusal is one line;
+#: this is room for context and a bound on a writer nobody here owns.
+MAX_SAID = 65536
+
+DIAGNOSTIC_FD = 2
+# A Rundesk released before this bridge answers as argparse does: exit 2, naming the choice it did
+# not recognize. Rundesk's own refusals exit 1, so the two are never mistaken for each other.
+UNSUPPORTED_EXIT = 2
+UNSUPPORTED_MARKS = ("invalid choice: '_oauth'", "invalid choice: 'login'",
+                     "invalid choice: 'google'", "unrecognized arguments")
+MAX_REASON = 400
 
 
-def resolve_env_file(explicit: str | None) -> Path:
-    if explicit:
-        return Path(explicit).expanduser()
-    for path in env_candidates():
-        if path.is_file():
-            return path
-    return env_candidates()[-1]
+def login_command(profile: str) -> str:
+    """The exact command that connects a Google account for one OAuth app profile."""
+    return "rundesk login google" + (f" --profile {profile}" if profile else "")
 
 
-def load_dotenv(path: Path, *, required: bool = False) -> None:
-    if not path.exists():
-        if required:
-            raise SearchConsoleError(f"Environment file does not exist: {path}")
-        return
-    try:
-        mode = path.stat().st_mode & 0o777
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise SearchConsoleError(f"Cannot read environment file {path}: {exc.strerror or exc}") from exc
-    if mode & 0o077:
-        print(f"WARNING: dotenv file {path} is accessible by group or others; use chmod 600.", file=sys.stderr)
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and key not in os.environ:
-            os.environ[key] = value
-
-
-def normalize(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
-
-
-def label_for_suffix(value: str) -> str:
-    return value.lower().replace("_", "-")
-
-
-def is_default(name: str) -> bool:
-    normalized = normalize(name)
-    return normalized in ("", "DEFAULT")
-
-
-def profile_form(name: str) -> str:
-    if is_default(name):
-        return "plain"
-    suffix = normalize(name)
-    has_suffix = any(os.environ.get(f"{field}__{suffix}") for field in REQUIRED)
-    has_legacy = any(
-        os.environ.get(f"{SKILL}_{suffix}_{FIELDS[field]}") for field in REQUIRED
-    )
-    if has_suffix and has_legacy:
+def rundesk_command() -> str:
+    """The rundesk this install means, which is a whole path and is not always on PATH."""
+    command = os.environ.get(COMMAND_VARIABLE, "").strip()
+    if command:
+        return command
+    found = shutil.which("rundesk")
+    if not found:
         raise SearchConsoleError(
-            f"Profile {name!r} is configured in both Rundesk suffix and legacy infix forms; remove one form."
+            f"This skill signs in through Rundesk, and no Rundesk is reachable: {COMMAND_VARIABLE} "
+            f"is unset and no rundesk command is on PATH. Run: {login_command('')}"
         )
-    if has_suffix:
-        return "suffix"
-    if has_legacy:
-        return "legacy"
-    return "none"
+    return found
 
 
-def profile_value(name: str, field: str) -> str:
-    suffix = normalize(name)
-    if field not in REQUIRED:
-        if suffix:
-            for key in (f"{field}__{suffix}", f"{SKILL}_{suffix}_{FIELDS[field]}"):
-                if os.environ.get(key):
-                    return os.environ[key]
-        return os.environ.get(field, "") if is_default(name) else ""
-    if is_default(name):
-        return os.environ.get(field, "")
-    form = profile_form(name)
-    if form == "suffix":
-        return os.environ.get(f"{field}__{suffix}", "")
-    if form == "legacy":
-        return os.environ.get(f"{SKILL}_{suffix}_{FIELDS[field]}", "")
+def read_exactly(connection: socket.socket, wanted: int, deadline: float) -> bytes:
+    """Exactly one bounded segment, refusing rather than waiting on an install that never answers."""
+    held = bytearray()
+    while len(held) < wanted:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SearchConsoleError("Rundesk did not answer the Google request in time.")
+        connection.settimeout(remaining)
+        try:
+            part = connection.recv(wanted - len(held))
+        except socket.timeout as exc:
+            raise SearchConsoleError("Rundesk did not answer the Google request in time.") from exc
+        if not part:
+            raise SearchConsoleError("Rundesk closed the Google response before answering.")
+        held.extend(part)
+    return bytes(held)
+
+
+def read_frame(connection: socket.socket, deadline: float) -> dict[str, Any]:
+    """One version 1 frame: four big-endian length bytes, then that much compact UTF-8 JSON.
+
+    `deadline` is a `time.monotonic` instant shared with the wait that follows, so reading and
+    reaping cannot each spend the whole allowance.
+    """
+    size = struct.unpack(">I", read_exactly(connection, 4, deadline))[0]
+    if size > MAX_FRAME:
+        raise SearchConsoleError("Rundesk sent an oversized Google response.")
+    try:
+        payload = json.loads(read_exactly(connection, size, deadline).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise SearchConsoleError("Rundesk sent a malformed Google response.") from exc
+    if not isinstance(payload, dict) or payload.get("version") != BRIDGE_VERSION:
+        raise SearchConsoleError("Rundesk sent a Google response version this package cannot read.")
+    return payload
+
+
+def framed_error(payload: dict[str, Any]) -> str:
+    """The refusal Rundesk framed, bounded. A frame carrying no reason yields nothing."""
+    reason = payload.get("error")
+    return reason.strip()[:MAX_REASON] if isinstance(reason, str) and reason.strip() else ""
+
+
+def bridge_reason(said: str) -> str:
+    """Rundesk's own refusal, bounded, and never more of another program's output than that."""
+    for line in said.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        head, marker, reason = stripped.partition(" — ")
+        return (reason if marker and head.endswith("FAILED") else stripped)[:MAX_REASON]
     return ""
 
 
-def missing_name(name: str, field: str) -> str:
-    if is_default(name):
-        return field
-    suffix = normalize(name)
-    if profile_form(name) == "legacy":
-        return f"{SKILL}_{suffix}_{FIELDS[field]}"
-    return f"{field}__{suffix}"
+def unsupported(code: int, said: str) -> bool:
+    """Whether this Rundesk predates managed sign-in rather than having refused the request."""
+    return code == UNSUPPORTED_EXIT and any(mark in said for mark in UNSUPPORTED_MARKS)
 
 
-def discovered_profiles() -> list[str]:
-    explicit = [item.strip() for item in os.environ.get(f"{SKILL}_PROFILES", "").split(",") if item.strip()]
-    default = os.environ.get(f"{SKILL}_DEFAULT_PROFILE", "")
-    if default and default not in explicit:
-        explicit.insert(0, default)
-    if explicit:
-        return explicit
-    names: set[str] = set()
-    infix_found = False
-    for key in os.environ:
-        for field in FIELDS:
-            prefix = f"{field}__"
-            suffix = key[len(prefix):] if key.startswith(prefix) else ""
-            if suffix and ACCOUNT_RE.fullmatch(suffix):
-                names.add(label_for_suffix(suffix))
-        for field, short in FIELDS.items():
-            match = re.fullmatch(rf"{SKILL}_({ACCOUNT_RE.pattern})_{short}", key)
-            if match and match.group(1) not in {"DEFAULT", "ENV"}:
-                names.add(label_for_suffix(match.group(1)))
-                infix_found = True
-    if not infix_found and any(os.environ.get(field) for field in REQUIRED):
-        names.add(default or "default")
-    return sorted(names)
+def refused(code: int, said: str, profile: str, framed: str = "",
+            trouble: str = "") -> SearchConsoleError:
+    if unsupported(code, said):
+        return SearchConsoleError(
+            "This Rundesk install is older than Rundesk-managed Google sign-in. Update Rundesk, "
+            f"then run: {login_command(profile)}"
+        )
+    # Rundesk's framed reason is its structured answer and comes first; its stderr says the same
+    # thing when it could not frame one; the protocol's own complaint is the last resort.
+    reason = framed or bridge_reason(said) or trouble or f"rundesk exited {code}"
+    # Rundesk names the login command itself when that is the fix. Appending it again turns one
+    # instruction into two identical ones, which reads as a program that has lost track of itself.
+    run = login_command(profile)
+    also = "" if run in reason else f" Run: {run}"
+    return SearchConsoleError(
+        f"Rundesk did not grant Google access: {reason}." + also
+    )
 
 
-def get_profile(name: str) -> Profile:
-    if name and not normalize(name):
-        raise SearchConsoleError("Profile names must contain at least one letter or digit.")
-    values = {field: profile_value(name, field) for field in FIELDS}
-    missing = [missing_name(name, field) for field in REQUIRED if not values[field]]
-    if missing:
-        raise SearchConsoleError("Missing required configuration: " + ", ".join(missing) + ". Run rundesk skills configure for this skill.")
-    return Profile(name, values[REQUIRED[0]], values[REQUIRED[1]], values[REQUIRED[2]], values["GOOGLE_SEARCH_CONSOLE_LABEL"] or name)
+def stop_group(process: subprocess.Popen) -> None:
+    """Signal the child's whole process group, because a descendant is what holds the pipe open.
+
+    Falls back to the child alone when there is no group to signal — it has already been reaped, or
+    the platform does not have one. Every failure here is ignored on purpose: this runs while a
+    deadline is already being enforced, and a command must not fail at the step whose whole job is
+    to stop something failing.
+    """
+    try:
+        # **`process.pid`, not `os.getpgid(process.pid)`.** Every spawn here uses
+        # `start_new_session=True`, so the child *is* the group leader and its pid is the group ID,
+        # known without asking anything. Asking has a race: `finished` reaches here having just
+        # seen the leader alive, and the leader can exit in the moment between that look and this
+        # call. `getpgid` would then raise `ESRCH` and nothing would be signalled, while the group
+        # it led still holds live members. The pid does not go stale that way.
+        os.killpg(process.pid, signal.SIGKILL)
+        return
+    except (ProcessLookupError, PermissionError, OSError, AttributeError):
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
 
 
-def selected_profile(args: argparse.Namespace) -> Profile:
-    names = discovered_profiles()
-    if args.profile:
-        return get_profile(args.profile)
-    if not names:
-        raise SearchConsoleError("No configured Google Search Console profiles. Run rundesk skills configure for this skill.")
-    if len(names) != 1:
-        raise SearchConsoleError("Multiple profiles are configured; select one with --profile: " + ", ".join(names))
-    return get_profile(names[0])
+def as_text(said: object) -> str:
+    """Partial output as bounded text, whatever shape the interruption left it in.
+
+    `TimeoutExpired` carries what had been read when it fired, and carries it as *bytes* even from
+    a text-mode child, because decoding happens after the read this never got to finish. Bounded
+    because nothing downstream needs more than the first refusal line, and an unbounded child
+    should not decide how much of this one's memory it uses.
+    """
+    if said is None:
+        return ""
+    if isinstance(said, bytes):
+        said = said.decode("utf-8", "replace")
+    return said[:MAX_SAID] if isinstance(said, str) else ""
+
+
+def abandoned(process: subprocess.Popen) -> str:
+    """Whatever the pipe has to give in a moment, and then let go of it.
+
+    Never waits on whatever is still holding the writing end: this is the path where that holder is
+    somebody else's business, so the read is bounded and the pipe is closed rather than drained.
+    """
+    said = ""
+    try:
+        _, said = process.communicate(timeout=LINGER_SECONDS)
+    except subprocess.TimeoutExpired as expired:
+        # **What was read before the wait ran out is kept.** A child that exited non-zero after
+        # launching a helper has already written why, and the helper is only holding the pipe open
+        # afterwards; dropping that would turn Rundesk's actual refusal into `rundesk exited 1`.
+        said = expired.stderr
+    except (ValueError, OSError):
+        said = ""
+    if process.stderr is not None:
+        try:
+            process.stderr.close()
+        except (OSError, ValueError):
+            pass
+    return as_text(said)
+
+
+def finished(process: subprocess.Popen, deadline: float, doing: str) -> tuple[str, int]:
+    """What Rundesk said and how it ended, never leaving a descendant holding this command open.
+
+    **A pipe that never reaches end-of-file is not the same as a command that never finished**, and
+    telling them apart is the whole of this. `communicate` waits for end-of-file, and Rundesk's
+    sign-in opens a browser that inherits the stderr being read — so on a perfectly successful
+    login the pipe stays open for as long as the person leaves the browser running.
+
+    So when the wait runs out, the question asked is *whether the child itself is still there*:
+
+    - **It has exited.** The sign-in is over and its exit code is the answer. Something it left
+      behind holds the pipe, and that something is the person's browser — killing it would turn a
+      completed sign-in into a window that vanished. The pipe is abandoned, not drained, and
+      whatever stderr came back in the moment allowed is kept.
+    - **It is still running.** Now it really is out of time. The whole process group is signalled —
+      by the pid that *is* the group, which `start_new_session=True` guarantees — reaped under a
+      bound, and refused.
+    """
+    try:
+        _, said = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
+        return said or "", process.returncode
+    except subprocess.TimeoutExpired:
+        pass
+    if process.poll() is not None:
+        return abandoned(process), process.returncode
+    stop_group(process)
+    try:
+        process.communicate(timeout=STOP_SECONDS)
+    except subprocess.TimeoutExpired:
+        abandoned(process)
+        try:
+            process.wait(timeout=STOP_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    raise SearchConsoleError(f"Rundesk did not finish {doing} in time, and was stopped.")
+
+
+def ask_rundesk(action: list[str], profile: str, seconds: float | None = None) -> dict[str, Any]:
+    """One `_oauth` answer, read from a socket pair no other process holds an end of."""
+    command = rundesk_command()
+    # One deadline for the whole transaction: spawning, reading the frame, and waiting for the exit
+    # share it, so a child that stalls in any one phase cannot extend the others.
+    deadline = time.monotonic() + (BRIDGE_SECONDS if seconds is None else seconds)
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        try:
+            process = subprocess.Popen(
+                [command, BRIDGE] + action + ["--response-fd", str(theirs.fileno())],
+                stdin=subprocess.DEVNULL, stdout=DIAGNOSTIC_FD, stderr=subprocess.PIPE,
+                start_new_session=True,
+                pass_fds=(theirs.fileno(),), text=True,
+            )
+        except OSError as exc:
+            raise SearchConsoleError(
+                f"Cannot run {command} to reach Google: {exc.strerror or exc}."
+            ) from exc
+        finally:
+            # Rundesk holds the only other end, so its refusal closes the socket instead of leaving
+            # this command waiting on an end it holds open itself.
+            theirs.close()
+        payload: dict[str, Any] = {}
+        trouble = ""
+        try:
+            # Read before waiting: Rundesk writes under its own deadline, and a child blocked on
+            # that write would never be reaped by a wait that came first.
+            payload = read_frame(ours, deadline)
+        except SearchConsoleError as exc:
+            trouble = str(exc)
+        said, code = finished(process, deadline, "the Google request")
+    finally:
+        ours.close()
+    if code != 0 or payload.get("ok") is not True:
+        raise refused(code, said, profile, framed_error(payload), trouble)
+    return payload
+
+
+def profile_action(action: list[str], profile: str) -> list[str]:
+    return action + (["--profile", profile] if profile else [])
+
+
+def signed_in_accounts(profile: str) -> list[str]:
+    """Every Google account Rundesk holds for one OAuth app profile. Local, with no network call."""
+    action = profile_action(["accounts", PROVIDER], profile)
+    accounts = ask_rundesk(action, profile).get("accounts")
+    if not isinstance(accounts, list) or not all(isinstance(one, str) for one in accounts):
+        raise SearchConsoleError("Rundesk sent a malformed Google account list.")
+    return accounts
+
+
+def managed_token(profile: str, email: str) -> tuple[str, str]:
+    """One short-lived token and the verified account it belongs to."""
+    action = profile_action(["access", PROVIDER, CAPABILITY], profile)
+    payload = ask_rundesk(action + (["--email", email] if email else []), profile)
+    token, expires, who = (payload.get("access_token"), payload.get("expires_at"),
+                           payload.get("email"))
+    subject = payload.get("subject")
+    # bool is an int, and an expiry of True would otherwise pass every check below.
+    if (not isinstance(token, str) or not token or not isinstance(who, str) or not who
+            or not isinstance(subject, str) or not subject
+            or isinstance(expires, bool) or not isinstance(expires, int)):
+        raise SearchConsoleError("Rundesk sent no usable Google access token.")
+    # Bearer is the one scheme this package knows how to send, so anything else is refused rather
+    # than sent as though it were one.
+    if payload.get("token_type") != "Bearer":
+        raise SearchConsoleError("Rundesk sent a Google access token this package cannot send.")
+    if expires <= int(time.time()):
+        raise SearchConsoleError(
+            f"Rundesk sent an already expired Google access token. Run: {login_command(profile)}"
+        )
+    # **Checked here as well as inside Rundesk, and the reason is whose promise it is.** This
+    # command is what told the caller which account it would use; a token for a different one would
+    # read every figure out of somebody else's Google account under the address they asked for.
+    # Compared case-insensitively because an address is not case-sensitive in its domain and
+    # providers vary in what they echo back.
+    if email and who.casefold() != email.casefold():
+        raise SearchConsoleError(
+            f"Rundesk returned a Google account other than {email}; no Google request was made."
+        )
+    return token, who
+
+
+def sign_in(profile: str, seconds: float | None = None) -> None:
+    """Rundesk's own public login, so the person sees the browser step and its result."""
+    command = rundesk_command()
+    action = ["login", "google"] + (["--profile", profile] if profile else [])
+    deadline = time.monotonic() + (SIGN_IN_SECONDS if seconds is None else seconds)
+    try:
+        process = subprocess.Popen(
+            [command] + action, stdin=subprocess.DEVNULL, stdout=DIAGNOSTIC_FD,
+            stderr=subprocess.PIPE, text=True, start_new_session=True,
+        )
+    except OSError as exc:
+        raise SearchConsoleError(
+            f"Cannot run {command} to sign in to Google: {exc.strerror or exc}."
+        ) from exc
+    said, code = finished(process, deadline, "signing in to Google")
+    if code != 0:
+        raise refused(code, said, profile)
+
+
+class Access:
+    """A Google account Rundesk holds. This package sees a token for it and never a grant."""
+
+    def __init__(self, profile: str, email: str) -> None:
+        self.profile = profile
+        self.wanted_email = email
+        self.name = profile or "default"
+        self.email = ""
+        self._token = ""
+
+    def token(self) -> str:
+        """The one token this command uses, fetched once and kept only in memory."""
+        if not self._token:
+            self._token, self.email = managed_token(self.profile, self.wanted_email)
+        return self._token
+
+
+def listed(trouble: str) -> None:
+    """Raise after a listing has been written, so the rows are seen and the exit is still earned.
+
+    Written first and refused second on purpose: a person gets the table with the reason in it, and
+    a script gets a non-zero exit instead of an empty account list it would have believed.
+    """
+    if trouble:
+        raise SearchConsoleError(trouble)
+
+
+def managed_rows(profile: str) -> tuple[list[dict[str, Any]], str]:
+    """What Rundesk holds for one app profile, and why the listing is incomplete when it is.
+
+    **Two different answers wear the same shape, and only one of them is success.** "Nothing is
+    connected yet" is a true, complete listing whose next step is a login, and it exits zero. "The
+    bridge could not be reached, spoke a version this package cannot read, or sent a malformed
+    list" is a listing that does not know what is connected — reported as a row so a person reading
+    the table sees why, *and* as a refusal so a script does not read an empty table as an empty
+    account list.
+    """
+    named = profile or "default"
+    try:
+        accounts = signed_in_accounts(profile)
+    except SearchConsoleError as exc:
+        return [{"profile": named, "account": "", "status": str(exc)}], str(exc)
+    if not accounts:
+        return [{"profile": named, "account": "", "status": f"run: {login_command(profile)}"}], ""
+    return [{"profile": named, "account": account, "status": "ready"}
+            for account in accounts], ""
+
+
+def selected_access(args: argparse.Namespace) -> Access:
+    """The one Google account this command will use, named before anything is asked of Google."""
+    profile = (getattr(args, "profile", "") or "").strip()
+    if getattr(args, "auth", False):
+        sign_in(profile)
+    return Access(profile, (getattr(args, "email", "") or "").strip())
 
 
 class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -287,6 +528,42 @@ def expect_objects(container: dict[str, Any], key: str, noun: str) -> list[dict[
     return [expect_object(item, noun) for item in expect_list(container, key, noun)]
 
 
+#: The most of a refusal body that is ever read. Google's error payloads are short, and an
+#: unbounded read here lets a remote party choose how much memory this command uses.
+MAX_ERROR_BODY = 65536
+
+
+def safe_error(exc: urllib.error.HTTPError) -> str:
+    """Google's own reason for refusing, or the status when it did not give one.
+
+    **Two shapes, and both are real.** A Google API error is `{"error": {"message": "..."}}`. An
+    OAuth token endpoint error is `{"error": "invalid_grant", "error_description": "..."}` — a
+    *string* where the other shape has an object. Reaching for `.get("message")` on that string
+    raises `AttributeError`, and the handler that swallowed it reported `HTTP 400` for a revoked
+    grant: true, and not the thing anybody needed to read. The body is read once, bounded, and
+    closed, because an `HTTPError` read twice yields nothing the second time.
+    """
+    try:
+        raw = exc.read(MAX_ERROR_BODY)
+    except OSError:
+        return f"HTTP {exc.code}"
+    finally:
+        exc.close()
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return f"HTTP {exc.code}"
+    if not isinstance(body, dict):
+        return f"HTTP {exc.code}"
+    error = body.get("error")
+    message = error.get("message") if isinstance(error, dict) else None
+    if not message and isinstance(body.get("error_description"), str):
+        message = body["error_description"]
+    if not message and isinstance(error, str):
+        message = error
+    return str(message).strip() if message and str(message).strip() else f"HTTP {exc.code}"
+
+
 def request_json(url: str, *, method: str = "GET", headers: dict[str, str] | None = None, body: dict[str, Any] | None = None, opener: Callable[..., Any] | None = None) -> dict[str, Any]:
     opener = opener or open_url
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -297,12 +574,7 @@ def request_json(url: str, *, method: str = "GET", headers: dict[str, str] | Non
         with opener(request, timeout=30) as response:
             payload = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        try:
-            message = json.loads(detail).get("error", {}).get("message", "")
-        except (ValueError, AttributeError):
-            message = ""
-        raise SearchConsoleError(f"Google API request failed with HTTP {exc.code}" + (f": {message}" if message else ".")) from exc
+        raise SearchConsoleError(f"Google API request failed: {safe_error(exc)}.") from exc
     except urllib.error.URLError as exc:
         raise SearchConsoleError(f"Google API request failed: {exc.reason}") from exc
     if not payload:
@@ -315,29 +587,10 @@ def request_json(url: str, *, method: str = "GET", headers: dict[str, str] | Non
     return expect_object(decoded, "API response")
 
 
-def access_token(profile: Profile, opener: Callable[..., Any] | None = None) -> str:
-    opener = opener or open_url
-    data = urllib.parse.urlencode({
-        "client_id": profile.client_id,
-        "client_secret": profile.client_secret,
-        "refresh_token": profile.refresh_token,
-        "grant_type": "refresh_token",
-    }).encode("utf-8")
-    request = urllib.request.Request(TOKEN_URL, data=data, method="POST", headers={"Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with opener(request, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as exc:
-        raise SearchConsoleError("Google OAuth token refresh failed; verify the profile credentials and grant.") from exc
-    token = expect_object(result, "OAuth token response").get("access_token", "")
-    if not isinstance(token, str) or not token:
-        raise SearchConsoleError("Google OAuth token refresh returned no access token.")
-    return token
-
-
-def api(profile: Profile, path: str, *, base: str = WEBMASTERS_API, method: str = "GET", body: dict[str, Any] | None = None) -> dict[str, Any]:
-    token = access_token(profile)
-    return request_json(base + path, method=method, headers={"Authorization": f"Bearer {token}"}, body=body)
+def api(access: Access, path: str, *, base: str = WEBMASTERS_API, method: str = "GET", body: dict[str, Any] | None = None) -> dict[str, Any]:
+    # The token is a header value and nothing else: never a query parameter, an argument, a variable
+    # in this process's environment, or anything written down.
+    return request_json(base + path, method=method, headers={"Authorization": f"Bearer {access.token()}"}, body=body)
 
 
 def write_rows(rows: list[dict[str, Any]], columns: list[str], as_json: bool) -> None:
@@ -358,17 +611,20 @@ def bounded(items: list[Any], limit: int, noun: str) -> list[Any]:
 
 
 def cmd_profiles(args: argparse.Namespace) -> None:
-    rows = []
-    for name in discovered_profiles():
-        missing = sum(not profile_value(name, field) for field in REQUIRED)
-        rows.append({"profile": name, "label": profile_value(name, "GOOGLE_SEARCH_CONSOLE_LABEL") or name, "status": "ready" if missing == 0 else f"missing {missing}"})
-    write_rows(rows, ["profile", "label", "status"], args.json)
+    """Which Google accounts Rundesk holds for one OAuth app profile, without asking Google."""
+    profile = (args.profile or "").strip()
+    if args.auth:
+        sign_in(profile)
+    rows, trouble = managed_rows(profile)
+    write_rows(rows, ["profile", "account", "status"], args.json)
+    listed(trouble)
+
 
 
 def cmd_sites(args: argparse.Namespace) -> None:
-    profile = selected_profile(args)
-    entries = expect_objects(api(profile, "/sites"), "siteEntry", "site entry")
-    rows = [{"site": item.get("siteUrl", ""), "permission": item.get("permissionLevel", ""), "profile": profile.name} for item in bounded(entries, args.limit, "sites")]
+    access = selected_access(args)
+    entries = expect_objects(api(access, "/sites"), "siteEntry", "site entry")
+    rows = [{"site": item.get("siteUrl", ""), "permission": item.get("permissionLevel", ""), "profile": access.name} for item in bounded(entries, args.limit, "sites")]
     write_rows(rows, ["site", "permission", "profile"], args.json)
 
 
@@ -455,7 +711,7 @@ def dimension_filter_groups(values: list[str]) -> list[dict[str, Any]]:
 def cmd_performance(args: argparse.Namespace) -> None:
     # Parsed before configuration so a malformed filter is reported as one, not as a missing profile.
     groups = dimension_filter_groups(args.filter)
-    profile = selected_profile(args)
+    access = selected_access(args)
     start, end = date_range(args)
     body: dict[str, Any] = {"startDate": start, "endDate": end, "rowLimit": args.limit, "startRow": 0}
     if args.dimension:
@@ -466,7 +722,7 @@ def cmd_performance(args: argparse.Namespace) -> None:
     if groups:
         body["dimensionFilterGroups"] = groups
     path = "/sites/" + urllib.parse.quote(args.site, safe="") + "/searchAnalytics/query"
-    items = expect_objects(api(profile, path, method="POST", body=body), "rows", "performance row")
+    items = expect_objects(api(access, path, method="POST", body=body), "rows", "performance row")
     if len(items) == args.limit:
         print(
             f"WARNING: performance output reached the {args.limit}-row limit and may be truncated.",
@@ -475,27 +731,27 @@ def cmd_performance(args: argparse.Namespace) -> None:
     rows = []
     for item in items:
         row = {dimension: value for dimension, value in zip(args.dimension, expect_list(item, "keys", "performance row key"))}
-        row.update({"clicks": item.get("clicks", 0), "impressions": item.get("impressions", 0), "ctr": item.get("ctr", 0), "position": item.get("position", 0), "profile": profile.name})
+        row.update({"clicks": item.get("clicks", 0), "impressions": item.get("impressions", 0), "ctr": item.get("ctr", 0), "position": item.get("position", 0), "profile": access.name})
         rows.append(row)
     write_rows(rows, args.dimension + ["clicks", "impressions", "ctr", "position", "profile"], args.json)
 
 
 def cmd_inspect(args: argparse.Namespace) -> None:
-    profile = selected_profile(args)
-    response = api(profile, "/urlInspection/index:inspect", base=INSPECTION_API, method="POST", body={"inspectionUrl": args.url, "siteUrl": args.site, "languageCode": "en-US"})
+    access = selected_access(args)
+    response = api(access, "/urlInspection/index:inspect", base=INSPECTION_API, method="POST", body={"inspectionUrl": args.url, "siteUrl": args.site, "languageCode": "en-US"})
     result = response.get("inspectionResult")
     index = result.get("indexStatusResult") if isinstance(result, dict) else None
     if not isinstance(index, dict) or not index:
         raise SearchConsoleError("Google returned no URL inspection result for the requested URL.")
-    row = {"url": args.url, "verdict": index.get("verdict", ""), "coverage_state": index.get("coverageState", ""), "indexing_state": index.get("indexingState", ""), "last_crawl": index.get("lastCrawlTime", ""), "robots_state": index.get("robotsTxtState", ""), "google_canonical": index.get("googleCanonical", ""), "user_canonical": index.get("userCanonical", ""), "profile": profile.name}
+    row = {"url": args.url, "verdict": index.get("verdict", ""), "coverage_state": index.get("coverageState", ""), "indexing_state": index.get("indexingState", ""), "last_crawl": index.get("lastCrawlTime", ""), "robots_state": index.get("robotsTxtState", ""), "google_canonical": index.get("googleCanonical", ""), "user_canonical": index.get("userCanonical", ""), "profile": access.name}
     write_rows([row], list(row), args.json)
 
 
 def cmd_sitemaps(args: argparse.Namespace) -> None:
-    profile = selected_profile(args)
+    access = selected_access(args)
     path = "/sites/" + urllib.parse.quote(args.site, safe="") + "/sitemaps"
-    items = expect_objects(api(profile, path), "sitemap", "sitemap entry")
-    rows = [{"path": item.get("path", ""), "type": item.get("type", ""), "submitted": item.get("lastSubmitted", ""), "downloaded": item.get("lastDownloaded", ""), "pending": item.get("isPending", False), "warnings": item.get("warnings", 0), "errors": item.get("errors", 0), "profile": profile.name} for item in bounded(items, args.limit, "sitemaps")]
+    items = expect_objects(api(access, path), "sitemap", "sitemap entry")
+    rows = [{"path": item.get("path", ""), "type": item.get("type", ""), "submitted": item.get("lastSubmitted", ""), "downloaded": item.get("lastDownloaded", ""), "pending": item.get("isPending", False), "warnings": item.get("warnings", 0), "errors": item.get("errors", 0), "profile": access.name} for item in bounded(items, args.limit, "sitemaps")]
     write_rows(rows, ["path", "type", "submitted", "downloaded", "pending", "warnings", "errors", "profile"], args.json)
 
 
@@ -531,7 +787,7 @@ def validated_sitemap(site: str, sitemap: str) -> str:
 
 
 def cmd_submit_sitemap(args: argparse.Namespace) -> None:
-    profile = selected_profile(args)
+    access = selected_access(args)
     sitemap = validated_sitemap(args.site, args.sitemap)
     path = sitemap_path(args.site, sitemap)
     if not args.confirm:
@@ -544,14 +800,14 @@ def cmd_submit_sitemap(args: argparse.Namespace) -> None:
             "url": WEBMASTERS_API + path,
             "scope": SUBMIT_SCOPE,
             "state": "preview",
-            "profile": profile.name,
+            "profile": access.name,
         }
         write_rows([row], list(row), args.json)
         raise SearchConsoleError("Refusing to submit without --confirm; the preview above changed nothing.")
     # Google answers the submission with an empty body, so success is only established by reading
     # the sitemap back rather than by the absence of an HTTP error.
-    api(profile, path, method="PUT")
-    entry = expect_object(api(profile, path), "sitemap entry")
+    api(access, path, method="PUT")
+    entry = expect_object(api(access, path), "sitemap entry")
     recorded = entry.get("path", "")
     if not isinstance(recorded, str) or not recorded:
         raise SearchConsoleError(
@@ -569,20 +825,23 @@ def cmd_submit_sitemap(args: argparse.Namespace) -> None:
         "warnings": entry.get("warnings", 0),
         "errors": entry.get("errors", 0),
         "state": "submitted",
-        "profile": profile.name,
+        "profile": access.name,
     }
     write_rows([row], list(row), args.json)
 
 
 def parser() -> argparse.ArgumentParser:
     parent = argparse.ArgumentParser(add_help=False)
-    parent.add_argument("--env-file")
     parent.add_argument("--json", action="store_true")
     profile = argparse.ArgumentParser(add_help=False)
-    profile.add_argument("--profile")
+    profile.add_argument("--profile", help="Which Google OAuth app profile Rundesk signed in with")
+    profile.add_argument("--email", help="Which signed-in Google account to use when Rundesk holds more than one")
+    profile.add_argument("--auth", action="store_true", help="Run `rundesk login google` first, with --profile when given")
     result = argparse.ArgumentParser(prog="google-search-console", description="Read bounded Google Search Console evidence and submit a sitemap on explicit confirmation.")
     subs = result.add_subparsers(dest="command", required=True)
-    p = subs.add_parser("profiles", parents=[parent], help="List locally configured profiles without contacting Google.")
+    p = subs.add_parser("profiles", parents=[parent], help="List the Google accounts Rundesk holds, without contacting Google.")
+    p.add_argument("--profile", help="OAuth app profile to list Rundesk's signed-in accounts for")
+    p.add_argument("--auth", action="store_true", help="Run `rundesk login google` first, with --profile when given")
     p.set_defaults(func=cmd_profiles)
     p = subs.add_parser("sites", parents=[parent, profile], help="List accessible Search Console properties.")
     p.add_argument("--limit", type=int, default=25)
@@ -619,7 +878,6 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = parser().parse_args(argv)
-        load_dotenv(resolve_env_file(args.env_file), required=bool(args.env_file))
         if hasattr(args, "limit") and not 1 <= args.limit <= 1000:
             raise SearchConsoleError("--limit must be between 1 and 1000.")
         if hasattr(args, "days") and not 1 <= args.days <= 480:
