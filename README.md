@@ -89,7 +89,7 @@ never the person.
 See [`skills/google-auth/references/cli.md`](skills/google-auth/references/cli.md) for the Google
 Cloud project, API enablement, consent-scope, and Desktop-client setup.
 
-Read [ENVIRONMENTS.md](ENVIRONMENTS.md) for OAuth ownership, configuration, cache, and state. Read the [Google integration lexicon](docs/lexicon.md)
+Read [ENVIRONMENTS.md](ENVIRONMENTS.md) for OAuth ownership, configuration, cache, and state. Read the [Google integration lexicon](docs/concepts/lexicon.md)
 for canonical product and resource terminology.
 
 ## Repository layout
@@ -99,7 +99,7 @@ for canonical product and resource terminology.
 ├── .github/
 │   ├── ISSUE_TEMPLATE/{bug-report.md,change-proposal.md}
 │   └── pull_request_template.md
-├── docs/lexicon.md
+├── docs/               orientation, and concepts/lexicon.md
 ├── skills/
 │   └── <name>/
 │       ├── SKILL.md
