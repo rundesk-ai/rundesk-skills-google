@@ -10,7 +10,7 @@ its own CLI, operating guidance, OAuth credential declaration, and offline tests
 
 - `README.md` defines the public catalog and install surface.
 - `ENVIRONMENTS.md` defines package runtime, OAuth profiles, configuration, and state boundaries.
-- `docs/lexicon.md` defines canonical Google catalog terminology and boundary mappings.
+- `docs/concepts/lexicon.md` defines canonical Google catalog terminology and boundary mappings.
 - `RELEASING.md` defines versioning and releases.
 - Each package's `SKILL.md` and `references/cli.md` define its agent and command contracts.
 - The [skill catalog guide](https://github.com/rundesk-ai/rundesk-cli/blob/main/docs/catalogs.md)
@@ -20,7 +20,8 @@ Keep these sources of truth aligned with the shipped files and behavior.
 
 ## Before you work
 
-1. Read `README.md`, `ENVIRONMENTS.md`, `docs/lexicon.md`, and `RELEASING.md` when the task touches
+1. Read `docs/BRIEF.md` and `docs/CODEMAP.md` for what this is and where its parts are,
+   then `README.md`, `ENVIRONMENTS.md`, `docs/concepts/lexicon.md`, and `RELEASING.md` when the task touches
    their contracts. Read every `SKILL.md`, reference, script, declaration, and test you will change.
 2. Inspect the skills supplied by the runtime and load the smallest complete set that applies. Use
    `writing-skills` for `SKILL.md`, applicable runtime or testing guidance for code and tests,
@@ -45,6 +46,7 @@ Keep these sources of truth aligned with the shipped files and behavior.
 │   ├── pull_request_template.md
 │   └── workflows/       CI workflows
 ├── docs/                catalog-wide terminology and supporting documentation
+├── docs/                orientation: the index, BRIEF, CODEMAP, and concepts/
 ├── skills/              independently installable Google integration packages
 ├── tests/               catalog-level structure and contract checks
 ├── AGENTS.md            agent instructions
@@ -143,14 +145,14 @@ scopes, rotation, revocation, and removal stay independent.
   concepts for convenience.
 - Verify current official Google endpoint, method, resource-name, query, scope, and response contracts
   before changing them. Preserve fixed Google names at the boundary and map them to the canonical terms
-  in `docs/lexicon.md`.
+  in `docs/concepts/lexicon.md`.
 - Keep command text compact and deterministic. Send operational errors, refusals, and truncation
   notices to stderr and return non-zero when requested work did not happen.
 - Comments explain non-obvious decisions, invariants, ordering, vendor behavior, and security
   boundaries. Do not narrate mechanics already clear from the code.
 - Use lowercase hyphenated package and command names. Keep the directory, manifest name, launcher,
   credential prefix, frontmatter `name`, and documented command spelling aligned.
-- Use `naming-grammar-conventions` and `docs/lexicon.md` when a term recurs across the CLI, Python,
+- Use `naming-grammar-conventions` and `docs/concepts/lexicon.md` when a term recurs across the CLI, Python,
   output, credentials, resources, and documentation.
 
 ## Documentation duties
@@ -159,14 +161,22 @@ Keep documentation true in the same change that changes behavior:
 
 - Add, remove, or rename a skill: update `manifest.json`, the README skill list, and catalog tests.
 - Change OAuth profiles, configuration, cache, or state: update `ENVIRONMENTS.md`.
-- Change canonical or cross-layer terminology: update `docs/lexicon.md` and affected surfaces.
+- Change canonical or cross-layer terminology: update `docs/concepts/lexicon.md` and affected surfaces.
 - Change the release process: update `RELEASING.md`.
 - Change setup, credentials, scopes, endpoints, resources, output, confirmation, or validation: update
   the package's `references/cli.md`.
 - Change required credentials: update `rundesk.json`, the command resolver, references, and tests.
 - Change triggers, safe defaults, boundaries, or non-obvious agent guidance: update `SKILL.md` using
   `writing-skills`.
-- Change either root agent guide: make `AGENTS.md` and `CLAUDE.md` byte-identical in the same change.
+- Change either root agent guide: make `AGENTS.md` and `CLAUDE.md` byte-identical in the same change.Keep `docs/` in its layout. Only `README.md`, `BRIEF.md`, and `CODEMAP.md` sit at its root; a home is
+added when there is a page for it and never left empty. Use the `structuring-project-docs` skill
+before adding a home, moving a page, or changing the shape of one. Ecosystem root files stay at the
+repository root, where consumers and tooling look for them.
+
+Update `docs/CODEMAP.md` when a count, a layer, or a file it names changes, and `docs/BRIEF.md` only
+when the purpose, audience, or refusals actually move. Keep pages thin: lead with the fact, use a
+table wherever the content is tabular, and never restate a package's own guidance at the repository
+level.
 
 Do not duplicate detailed CLI reference material in `SKILL.md`. Keep public examples synthetic,
 reference secrets only by variable name, and use reserved domains such as `example.test`.
@@ -210,7 +220,7 @@ git diff --check
 1. Complete the full requested scope and preserve every gate in this file.
 2. Run the root catalog suite, every touched package suite, applicable launcher checks, guide parity
    check, focused tests, and `git diff --check`; report exact observed results.
-3. Keep `README.md`, `manifest.json`, package directories, tests, `ENVIRONMENTS.md`, `docs/lexicon.md`,
+3. Keep `README.md`, `manifest.json`, package directories, tests, `ENVIRONMENTS.md`, `docs/concepts/lexicon.md`,
    `RELEASING.md`, `AGENTS.md`, and `CLAUDE.md` synchronized wherever the change touches their contracts.
 4. Exercise the material command path through its public launcher with safe synthetic or test data.
    Report any live Google or OAuth proof that was not authorized or available.
