@@ -12,13 +12,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_SKILLS = {"google-analytics", "google-auth", "google-merchant",
+EXPECTED_SKILLS = {"google-analytics", "google-auth", "google-crux", "google-merchant",
                    "google-pagespeed-insights", "google-search-console"}
 
 #: Which packages still declare owner-supplied values, and which no longer can. A package that
 #: signs in through Rundesk's broker declares nothing: its client and its grant are Rundesk's, and
 #: a `rundesk.json` naming them would be the second place a credential lived.
-DECLARING = {"google-pagespeed-insights"}
+DECLARING = {"google-crux", "google-pagespeed-insights"}
 ALLOWED_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 DECLARED_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 CATALOG_GUIDE = "https://github.com/rundesk-ai/rundesk-cli/blob/main/docs/catalogs.md"
@@ -99,7 +99,9 @@ README_ANCHORS = (
     ".github/ISSUE_TEMPLATE/change-proposal.md",
     ".github/pull_request_template.md",
     "python3 skills/google-search-console/scripts/google-search-console.d/test-google-search-console.py -q",
+    "python3 skills/google-crux/scripts/google-crux.d/test-google-crux.py -q",
     '(cd /tmp && "$repository_root/skills/google-search-console/scripts/google-search-console" --help)',
+    '(cd /tmp && "$repository_root/skills/google-crux/scripts/google-crux" --help)',
 )
 PR_CHECKLIST_ANCHORS = (
     "Every mutation remains a preview until the owner approves the exact target and effect and "

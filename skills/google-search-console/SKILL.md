@@ -29,7 +29,8 @@ use it to choose an account — that is always `--email`. Never ask anyone for a
 secret, or a refresh token.
 
 Keep performance reads narrow. Default to the last 28 complete days in Google's Pacific reporting
-zone and a small row limit; add only the dimensions needed for the question:
+zone and a small row limit; add only the dimensions needed for the question. When the question
+requires a larger extract, the command safely pages in API-sized batches up to 50,000 rows:
 
 ```sh
 "$RUNDESK_SKILLS/google-search-console/scripts/google-search-console" performance \
@@ -57,8 +58,9 @@ Filterable dimensions are `query`, `page`, `country`, `device`, and `searchAppea
 
 Performance rows are aggregated and may omit anonymized queries. Treat clicks, impressions,
 click-through rate, and average position as Search Console measurements, not complete traffic or
-ranking truth. State the date range and dimensions with findings, and report dates as Pacific
-reporting days rather than local ones.
+ranking truth. Even a fully paged result is representative rather than guaranteed complete. State
+the date range and dimensions with findings, and report dates as Pacific reporting days rather than
+local ones.
 
 Every command except `submit-sitemap` is read-only. `submit-sitemap` changes Google's state, so
 it prints the exact request it would send and refuses until `--confirm` is passed:

@@ -15,7 +15,7 @@ several signed-in accounts. Commands report the selected profile alongside the r
 
 Use `profile` for the app configuration and `account` for the signed-in Google identity chosen with
 `--email`. Avoid `connection` and `login` for either. An API-key package has no profile of this kind;
-`google-pagespeed-insights` names its own configuration instead.
+`google-pagespeed-insights` and `google-crux` name their own configurations instead.
 
 ### Google identity
 
@@ -104,12 +104,13 @@ and `category` for Google's performance, accessibility, best-practices, and SEO 
 lowercase names are the Lighthouse result keys; the query enums are `PERFORMANCE`, `ACCESSIBILITY`,
 `BEST_PRACTICES`, and `SEO`. Keep the lowercase form everywhere except the request itself.
 
-### Field data
+### Compatibility field data
 
 The Chrome UX Report summary of real users' recent experiences that PageSpeed Insights returns
 beside the Lighthouse run. Use `field data` for it and `lab` for the Lighthouse assessment, and
-never present one as evidence for the other. It is not Core Web Vitals history; it is one trailing
-window.
+never present one as evidence for the other. This is a compatibility surface pending Google's
+removal; route new field-data work to `google-crux`. It is not Core Web Vitals history; it is one
+trailing window.
 
 ### Scope
 
@@ -119,6 +120,33 @@ scope and the effective scope together, because Google answers a page with too f
 origin data and marks that with `origin_fallback`. Google omits `origin_fallback` unless it is
 true, so an absent flag means the reading is not a fallback. Do not call a scope a property, a
 site, or a domain.
+
+## Chrome UX Report
+
+### CrUX record
+
+Google's field-data evidence for one eligible public URL or origin, optionally narrowed to phone,
+tablet, or desktop experiences. Use `record` for the API object and report both the requested and
+returned `identifier`; Google may normalize the identifier it uses for lookup. Never replace an
+unavailable URL record with origin evidence without saying that the scope changed.
+
+### Collection period
+
+The 28-day rolling window behind a CrUX record. `current` is the latest daily window. `history` is a
+weekly time series of overlapping 28-day windows, so its periods are trend points rather than
+independent samples. Use `first date` and `last date` for the inclusive bounds.
+
+### Form factor
+
+The CrUX segmentation of eligible experiences: `all`, `phone`, `tablet`, or `desktop`. Use `form
+factor`, not PageSpeed's `strategy`; CrUX describes real-user populations while Lighthouse strategy
+selects device emulation.
+
+### Eligibility
+
+Whether a metric has enough eligible Chrome user samples for a collection period. Use `eligible`
+and preserve missing historical values as empty with `eligible=false`. Never turn missing p75 or
+`NaN` histogram densities into zero.
 
 ## Merchant Center
 

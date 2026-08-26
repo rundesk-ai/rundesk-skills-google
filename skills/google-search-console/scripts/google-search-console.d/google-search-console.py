@@ -40,6 +40,12 @@ DEVICE_VALUES = ("DESKTOP", "MOBILE", "TABLET")
 COUNTRY_CODE_RE = re.compile(r"[A-Za-z]{3}")
 # Google publishes no expression limit; this bound keeps a mistyped argument out of the request.
 MAX_EXPRESSION = 4096
+# Search Analytics accepts at most 25,000 rows per request. Google documents up to 50,000
+# available rows per day, site, and search type through two offset pages; the command keeps that
+# whole retrieval bounded even when the caller asks for the maximum.
+PERFORMANCE_PAGE_LIMIT = 25000
+PERFORMANCE_LIMIT = 50000
+LIST_LIMIT = 1000
 
 
 class SearchConsoleError(RuntimeError):
@@ -708,12 +714,42 @@ def dimension_filter_groups(values: list[str]) -> list[dict[str, Any]]:
     return [{"groupType": "and", "filters": [parse_filter(value) for value in values]}]
 
 
+def performance_pages(
+    access: Access, path: str, body: dict[str, Any], limit: int
+) -> list[dict[str, Any]]:
+    """Retrieve consecutive Search Analytics pages without exceeding the caller's bound.
+
+    A short page establishes the end. A full final page establishes only that the requested bound
+    was reached, so the caller warns rather than claiming the result is complete.
+    """
+    rows: list[dict[str, Any]] = []
+    while len(rows) < limit:
+        page_limit = min(PERFORMANCE_PAGE_LIMIT, limit - len(rows))
+        request = dict(body, rowLimit=page_limit, startRow=len(rows))
+        page = expect_objects(
+            api(access, path, method="POST", body=request), "rows", "performance row"
+        )
+        if len(page) > page_limit:
+            raise SearchConsoleError(
+                f"Google returned more than the requested {page_limit} performance rows."
+            )
+        rows.extend(page)
+        if len(page) < page_limit:
+            break
+    if len(rows) == limit:
+        print(
+            f"WARNING: performance output reached the {limit}-row limit and may be truncated.",
+            file=sys.stderr,
+        )
+    return rows
+
+
 def cmd_performance(args: argparse.Namespace) -> None:
     # Parsed before configuration so a malformed filter is reported as one, not as a missing profile.
     groups = dimension_filter_groups(args.filter)
     access = selected_access(args)
     start, end = date_range(args)
-    body: dict[str, Any] = {"startDate": start, "endDate": end, "rowLimit": args.limit, "startRow": 0}
+    body: dict[str, Any] = {"startDate": start, "endDate": end}
     if args.dimension:
         body["dimensions"] = args.dimension
     if args.search_type:
@@ -722,12 +758,7 @@ def cmd_performance(args: argparse.Namespace) -> None:
     if groups:
         body["dimensionFilterGroups"] = groups
     path = "/sites/" + urllib.parse.quote(args.site, safe="") + "/searchAnalytics/query"
-    items = expect_objects(api(access, path, method="POST", body=body), "rows", "performance row")
-    if len(items) == args.limit:
-        print(
-            f"WARNING: performance output reached the {args.limit}-row limit and may be truncated.",
-            file=sys.stderr,
-        )
+    items = performance_pages(access, path, body, args.limit)
     rows = []
     for item in items:
         row = {dimension: value for dimension, value in zip(args.dimension, expect_list(item, "keys", "performance row key"))}
@@ -878,8 +909,10 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = parser().parse_args(argv)
-        if hasattr(args, "limit") and not 1 <= args.limit <= 1000:
-            raise SearchConsoleError("--limit must be between 1 and 1000.")
+        if hasattr(args, "limit"):
+            maximum = PERFORMANCE_LIMIT if args.command == "performance" else LIST_LIMIT
+            if not 1 <= args.limit <= maximum:
+                raise SearchConsoleError(f"--limit must be between 1 and {maximum}.")
         if hasattr(args, "days") and not 1 <= args.days <= 480:
             raise SearchConsoleError("--days must be between 1 and 480.")
         args.func(args)

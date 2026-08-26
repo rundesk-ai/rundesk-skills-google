@@ -143,6 +143,54 @@ class SearchConsoleTest(unittest.TestCase):
             self.module.cmd_performance(args)
         self.assertIn("may be truncated", error.getvalue())
 
+    def test_performance_pages_in_api_sized_batches_until_the_requested_limit(self):
+        args = SimpleNamespace(
+            profile="example", site="sc-domain:example.test", days=28,
+            start_date="2026-07-01", end_date="2026-07-31",
+            dimension=["query"], search_type=None, filter=[], limit=25002, json=True,
+        )
+        first = {"rows": [{"keys": [f"query-{index}"]} for index in range(25000)]}
+        second = {"rows": [{"keys": ["query-25000"]}, {"keys": ["query-25001"]}]}
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
+            self.module, "api", side_effect=[first, second]
+        ) as call, redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+            self.module.cmd_performance(args)
+        self.assertEqual(2, call.call_count)
+        first_body = call.call_args_list[0].kwargs["body"]
+        second_body = call.call_args_list[1].kwargs["body"]
+        self.assertEqual((25000, 0), (first_body["rowLimit"], first_body["startRow"]))
+        self.assertEqual((2, 25000), (second_body["rowLimit"], second_body["startRow"]))
+        self.assertEqual(25002, len(json.loads(output.getvalue())))
+        self.assertIn("reached the 25002-row limit", error.getvalue())
+
+    def test_performance_stops_after_a_short_page_without_a_truncation_warning(self):
+        args = SimpleNamespace(
+            profile="example", site="sc-domain:example.test", days=28,
+            start_date="2026-07-01", end_date="2026-07-31",
+            dimension=["query"], search_type=None, filter=[], limit=50000, json=True,
+        )
+        payload = {"rows": [{"keys": ["one"]}, {"keys": ["two"]}]}
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
+            self.module, "api", return_value=payload
+        ) as call, redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+            self.module.cmd_performance(args)
+        self.assertEqual(1, call.call_count)
+        self.assertEqual(2, len(json.loads(output.getvalue())))
+        self.assertNotIn("truncated", error.getvalue())
+
+    def test_performance_refuses_a_page_larger_than_google_was_asked_for(self):
+        args = SimpleNamespace(
+            profile="example", site="sc-domain:example.test", days=28,
+            start_date="2026-07-01", end_date="2026-07-31",
+            dimension=["query"], search_type=None, filter=[], limit=1, json=True,
+        )
+        payload = {"rows": [{"keys": ["one"]}, {"keys": ["two"]}]}
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
+            self.module, "api", return_value=payload
+        ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(self.module.SearchConsoleError, "more than the requested"):
+                self.module.cmd_performance(args)
+
     def test_inspect_url_uses_inspection_api_and_normalizes_result(self):
         args = SimpleNamespace(profile="example", site="sc-domain:example.test", url="https://example.test/page", json=True)
         payload = {"inspectionResult": {"indexStatusResult": {"verdict": "PASS", "coverageState": "Submitted and indexed", "lastCrawlTime": "2026-08-01T12:00:00Z"}}}
@@ -270,6 +318,16 @@ class SearchConsoleTest(unittest.TestCase):
             code = self.module.main(["sites", "--profile", "example", "--limit", "1001"])
         self.assertEqual(code, 2)
         self.assertIn("between 1 and 1000", error.getvalue())
+
+    def test_main_allows_bounded_performance_pagination_and_rejects_more(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            self.module, "selected_access", side_effect=AssertionError("configuration")
+        ), redirect_stderr(io.StringIO()) as error:
+            code = self.module.main([
+                "performance", "--site", "sc-domain:example.test", "--limit", "50001"
+            ])
+        self.assertEqual(2, code)
+        self.assertIn("between 1 and 50000", error.getvalue())
 
     def performance_args(self, **overrides):
         values = dict(

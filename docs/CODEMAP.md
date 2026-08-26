@@ -6,7 +6,7 @@ the tree moves on without this page.
 Every package is a directory under `skills/` holding a `SKILL.md`, the references it loads on
 demand, and the one command it ships under `scripts/`. Nothing else in the repository is large.
 
-## Packages (skills/ — 5, 5 reference files)
+## Packages (skills/ — 6, 9 reference files)
 
 Each holds `SKILL.md` for routing and core procedure, and `references/` for detail loaded on demand.
 `references/sources.md` is required in every touched package.
@@ -15,17 +15,18 @@ Each holds `SKILL.md` for routing and core procedure, and `references/` for deta
 |---|---|---|
 | `google-analytics` | 1 | yes |
 | `google-auth` | 1 | yes |
+| `google-crux` | 2 | yes |
 | `google-merchant` | 1 | yes |
-| `google-pagespeed-insights` | 1 | yes |
-| `google-search-console` | 1 | yes |
+| `google-pagespeed-insights` | 2 | yes |
+| `google-search-console` | 2 | yes |
 
-5 of 5 packages ship a command under `scripts/`. The rest are guidance only.
+6 of 6 packages ship a command under `scripts/`.
 
 ## Identity (root)
 
 | File | What it is |
 |---|---|
-| `manifest.json` | schema, name, version (`0.3.0`), and description |
+| `manifest.json` | schema, name, version (`0.4.0`), and description |
 | `README.md` | the consumer contract: what the catalog is, how to install it, and every package |
 | `ENVIRONMENTS.md` | the OAuth ownership, configuration, cache, and state contract |
 | `AGENTS.md`, `CLAUDE.md` | the repository guide, byte-identical by contract |
