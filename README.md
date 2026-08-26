@@ -1,8 +1,8 @@
 # Rundesk Google Skills
 
 Guarded Google service integrations packaged as reusable Agent Skills with self-contained command
-runtimes, OAuth profiles, and offline tests. The catalog is read-only apart from Search Console's
-confirmation-guarded sitemap submission.
+runtimes, OAuth or API-key profiles, and offline tests. The catalog is read-only apart from Search
+Console's confirmation-guarded sitemap submission.
 
 ## Skills
 
@@ -10,10 +10,12 @@ confirmation-guarded sitemap submission.
   choosing the Google accounts Rundesk holds.
 - `google-analytics` - accessible GA4 accounts and properties, bounded traffic, audience, key-event,
   ecommerce, and direct Analytics Data API reports.
+- `google-crux` - current and six-month Chrome UX Report Core Web Vitals evidence by public URL or
+  origin and form factor.
 - `google-merchant` - Merchant Center accounts, product serving status, item issues, bounded product
   performance, and price and market insights.
-- `google-pagespeed-insights` - bounded Lighthouse scores, lab metrics, prioritized audit
-  findings, and opt-in Chrome UX Report field data for public webpages.
+- `google-pagespeed-insights` - bounded Lighthouse scores, lab metrics, and prioritized audit
+  findings for public webpages.
 - `google-search-console` - accessible sites, bounded search performance, sitemaps, URL inspection,
   and confirmation-guarded sitemap submission.
 
@@ -57,8 +59,9 @@ scopes, and resource discovery sequence.
   owns the browser flow, keeps the grant sealed, and refreshes tokens; a package declares no
   credentials and receives one short-lived access token over a private socket when it runs. Never
   put a secret value or a grant in the catalog.
-- PageSpeed is the exception: it reads public pages with a Google Cloud API key declared in its own
-  `rundesk.json`, and signs nobody in.
+- PageSpeed and CrUX read public measurements with separate Google Cloud API keys declared in their
+  own `rundesk.json` files and sign nobody in. CrUX owns field-history work; PageSpeed remains the
+  Lighthouse lab-analysis package.
 - Explicit account and resource selection when more than one Google account, property, site, or
   Merchant account is available.
 
@@ -124,9 +127,11 @@ Runtime files never depend on a sibling package or a root-local library.
 ```sh
 python3 -m unittest discover -s tests -v
 python3 skills/google-search-console/scripts/google-search-console.d/test-google-search-console.py -q
+python3 skills/google-crux/scripts/google-crux.d/test-google-crux.py -q
 skills/google-search-console/scripts/google-search-console --help
 repository_root="$(pwd)"
 (cd /tmp && "$repository_root/skills/google-search-console/scripts/google-search-console" --help)
+(cd /tmp && "$repository_root/skills/google-crux/scripts/google-crux" --help)
 git diff --check
 ```
 

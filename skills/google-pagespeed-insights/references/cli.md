@@ -265,15 +265,7 @@ skills/google-pagespeed-insights/scripts/google-pagespeed-insights profiles
 Tests are offline and replace the Google API network boundary with synthetic responses, including
 hostile fixtures for null, wrong-shaped, and non-finite values.
 
-## Official references
-
-- [PageSpeed Insights API](https://developers.google.com/speed/docs/insights/rest)
-- [Get started](https://developers.google.com/speed/docs/insights/v5/get-started)
-- [runPagespeed method](https://developers.google.com/speed/docs/insights/rest/v5/pagespeedapi/runpagespeed)
-- [About PageSpeed Insights](https://developers.google.com/speed/docs/insights/v5/about)
-- [Release notes](https://developers.google.com/speed/docs/insights/release_notes)
-- [CrUX data on PageSpeed Insights](https://developer.chrome.com/docs/crux/guides/pagespeed-insights)
-- [PageSpeed Insights v5 discovery document](https://pagespeedonline.googleapis.com/$discovery/rest?version=v5)
+## Google contract notes
 
 The runPagespeed reference defines the response fields, including the snake_case `overall_category`,
 `initial_url`, and the optional `origin_fallback`, and the metric shape of `percentile`, `distributions` with
@@ -295,7 +287,10 @@ Two gaps in the published contract shape this package:
   is why the column is named `percentile` rather than a percentile-specific name.
 
 The Get started page states that Google plans to discontinue including Chrome UX Report data in this
-API, without a published date, and recommends the CrUX API and CrUX History API instead. No
-migration is made here because the field data is still returned and a separate API would need its
-own approval. When Google removes it, the `loadingExperience` and `originLoadingExperience` objects
-disappear from the response and the command reports no field data rather than failing.
+API, without a published date, and recommends the CrUX API and CrUX History API instead. New field
+work belongs to `google-crux`; the PageSpeed option remains only for compatibility. When Google
+removes the fields, `loadingExperience` and `originLoadingExperience` disappear from the response
+and the command reports no field data rather than failing.
+
+See [sources](sources.md) for the official endpoint, response, Lighthouse, field-data, and removal
+contracts used here.

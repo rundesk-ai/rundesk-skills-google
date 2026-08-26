@@ -1,6 +1,6 @@
 ---
 name: google-pagespeed-insights
-description: Use when the user needs a current Google PageSpeed Insights or Lighthouse assessment for a specific public webpage, including performance, accessibility, best-practices, or SEO scores, prioritized audit findings, or the recent real-user Core Web Vitals field data Chrome reports for that page and its origin. It supplies bounded read-only lab and field evidence through the PageSpeed Insights API. Do not use for Search Console data, Analytics data, private-page testing, Core Web Vitals history or trends, or changing a website.
+description: Use when the user needs a current Google PageSpeed Insights or Lighthouse lab assessment for a specific public webpage, including performance, accessibility, best-practices, or SEO scores and prioritized audit findings. It supplies bounded read-only lab evidence through the PageSpeed Insights API. Do not use for CrUX field data or history, Search Console data, Analytics data, private-page testing, or changing a website.
 ---
 
 # Google PageSpeed Insights
@@ -30,7 +30,10 @@ Treat Lighthouse scores as a point-in-time lab assessment. Results can vary with
 network conditions, Lighthouse versions, and server load. Report the tested URL, strategy,
 categories, fetch time, and API-provided Lighthouse version with findings.
 
-## Field data
+## Compatibility field data
+
+Route new current or historical field-data work to `google-crux`. The PageSpeed field-data flag is
+preserved only for existing callers while Google completes its planned removal from this API.
 
 The same response carries Chrome UX Report field data: real users' experiences over a trailing
 28-day window, updated daily. It is off by default and must be asked for:
@@ -90,4 +93,5 @@ stdout are the sections that did:
   status as invalidating the lab result.
 
 This package is read-only. It cannot change a webpage, hosting configuration, Search Console
-property, Analytics property, or Google Cloud project.
+property, Analytics property, or Google Cloud project. Read `references/sources.md` when auditing
+or changing its Google API contract.

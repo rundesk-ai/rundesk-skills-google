@@ -15,9 +15,12 @@ google-search-console submit-sitemap --profile example --site https://www.exampl
 ```
 
 Every command except `submit-sitemap` is read-only. Text is the compact default; pass `--json` for
-structured output. `sites`, `performance`, and `sitemaps` default to 25 results and accept `--limit` from 1 to
-1,000. When a list is cut to the requested limit, the command warns on stderr that output may be
-truncated.
+structured output. `sites`, `performance`, and `sitemaps` default to 25 results. `sites` and
+`sitemaps` accept `--limit` from 1 to 1,000. `performance` accepts 1 to 50,000, requests at most
+25,000 rows per API call, and continues with `startRow` offsets until Google returns a short page or
+the requested limit is reached. Reaching the requested limit warns on stderr that more rows may
+exist. Pagination raises the safe ceiling; Search Analytics still returns top rows and does not
+promise a complete export.
 
 `performance` defaults to the last 28 complete days in Google's Pacific reporting zone
 (`America/Los_Angeles`), which is how Search Console buckets rows; a late-evening UTC run therefore
@@ -155,15 +158,5 @@ skills/google-search-console/scripts/google-search-console profiles
 Tests are offline: a stand-in Rundesk answers the sign-in bridge exactly as the real one
 documents it, and synthetic responses stand in for Google.
 
-## Official references
-
-- [Search Console API authorization](https://developers.google.com/webmaster-tools/v1/how-tos/authorizing)
-- [Google OAuth 2.0](https://developers.google.com/identity/protocols/oauth2)
-- [Sites: list](https://developers.google.com/webmaster-tools/v1/sites/list)
-- [Search Analytics: query](https://developers.google.com/webmaster-tools/v1/searchanalytics/query)
-- [URL Inspection: index.inspect](https://developers.google.com/webmaster-tools/v1/urlInspection.index/inspect)
-- [Sitemaps: list](https://developers.google.com/webmaster-tools/v1/sitemaps/list)
-- [Sitemaps: get](https://developers.google.com/webmaster-tools/v1/sitemaps/get)
-- [Sitemaps: submit](https://developers.google.com/webmaster-tools/v1/sitemaps/submit)
-- [Query your Search analytics data](https://developers.google.com/webmaster-tools/v1/how-tos/search_analytics)
-- [RE2 syntax](https://github.com/google/re2/wiki/Syntax)
+See [sources](sources.md) for the official authorization, endpoint, pagination, result-completeness,
+filtering, inspection, and sitemap contracts used here.
