@@ -69,6 +69,14 @@ The dimension a bounded report groups by, named for the question rather than the
 `channel`, `country`, or `brand`. Use `breakdown` for the command option and the concept. It is not
 a segment, a filter, or a comparison; it only chooses the grouping the package already supports.
 
+### Traffic segment
+
+A fixed acquisition subset applied to a bounded Analytics report. `organic-search` means GA4's
+`Organic Search` default channel group; `google-organic` means the narrower exact source `google`
+and medium `organic`. The subset is session-scoped unless a traffic command explicitly selects
+first-user scope. Use `segment` for this report subset and never use it as a synonym for attribution
+credit, causal impact, or a Search Console filter.
+
 ### Key event
 
 An event a property marks as significant, and the name Google adopted in 2024 for what it
@@ -81,6 +89,14 @@ two in one sentence.
 A product in Google Analytics ecommerce measurement. Use `item` for the API-facing concept and
 `product` only in prose about a shop. An item exists in Analytics because the site sent an ecommerce
 event about it; it is not a Merchant Center product and carries no feed, price, or availability.
+
+### Funnel
+
+An ordered sequence of event conditions evaluated for users by the Analytics Data API. Use
+`funnel` only for this ordered population and its step completion and abandonment measures. A list
+of aggregate event counts is not a funnel. This package's ecommerce funnel is closed, so users must
+enter through the first step. Google's recommended lead events do not define one canonical order;
+a lead funnel must follow the business's explicitly documented local process.
 
 ## PageSpeed Insights
 

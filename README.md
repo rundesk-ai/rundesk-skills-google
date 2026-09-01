@@ -8,8 +8,9 @@ Console's confirmation-guarded sitemap submission.
 
 - `google-auth` - the catalog's Google provider declaration, plus connecting, listing, and
   choosing the Google accounts Rundesk holds.
-- `google-analytics` - accessible GA4 accounts and properties, bounded traffic, audience, key-event,
-  ecommerce, and direct Analytics Data API reports.
+- `google-analytics` - accessible GA4 accounts and properties, Organic Search segments, bounded
+  traffic, audience, key-event, lead-lifecycle, ordered ecommerce funnel, ecommerce, metadata,
+  compatibility, and direct Analytics Data API reports.
 - `google-crux` - current and six-month Chrome UX Report Core Web Vitals evidence by public URL or
   origin and form factor.
 - `google-merchant` - Merchant Center accounts, product serving status, item issues, bounded product
@@ -127,6 +128,7 @@ Runtime files never depend on a sibling package or a root-local library.
 ```sh
 python3 -m unittest discover -s tests -v
 python3 skills/google-search-console/scripts/google-search-console.d/test-google-search-console.py -q
+python3 skills/google-analytics/scripts/google-analytics.d/test-google-analytics.py -q
 python3 skills/google-crux/scripts/google-crux.d/test-google-crux.py -q
 skills/google-search-console/scripts/google-search-console --help
 repository_root="$(pwd)"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read bounded Google Analytics 4 account, traffic, audience, key-event, commerce, and realtime data."""
+"""Read bounded Google Analytics 4 acquisition, audience, event, funnel, and commerce data."""
 
 from __future__ import annotations
 
@@ -24,10 +24,38 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 ADMIN_BASE = "https://analyticsadmin.googleapis.com/v1beta"
 DATA_BASE = "https://analyticsdata.googleapis.com/v1beta"
-FIELD_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+FUNNEL_DATA_BASE = "https://analyticsdata.googleapis.com/v1alpha"
+BASE_FIELD_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+# **ASCII digits, not `str.isdigit`.** `isdigit` is true for Arabic-Indic and other Unicode digits,
+# and a resource ID goes into the request path: a non-ASCII "number" would pass the check and then
+# raise `UnicodeEncodeError` deep inside urllib instead of being refused here.
+NUMERIC_ID_RE = re.compile(r"[0-9]{1,20}")
 MAX_PAGES = 100
 MAX_DIMENSIONS = 9
 MAX_METRICS = 10
+#: GA4's longest event, event-parameter, and item-parameter name. User-property names are capped
+#: lower, at 24, but the difference is Google's to enforce; this bound only keeps an unbounded
+#: caller string out of a request.
+MAX_GA4_NAME = 40
+#: Every colon-bearing field family the Data API documents, and what the part after the colon is:
+#: a GA4 parameter or user-property name, a GA4 event name, or a numeric custom channel ID. A base
+#: outside this table never takes a suffix, so `date:anything` is refused rather than sent.
+CUSTOM_FIELD_SUFFIXES = {
+    "customEvent": "name",
+    "customUser": "name",
+    "customItem": "name",
+    "averageCustomEvent": "name",
+    "countCustomEvent": "name",
+    "sessionKeyEventRate": "name",
+    "userKeyEventRate": "name",
+    "sessionCustomChannelGroup": "channel",
+    "firstUserCustomChannelGroup": "channel",
+    "customChannelGroup": "channel",
+}
+#: The one family whose suffix may also carry a bracketed event name, for an event-scoped custom
+#: dimension registered before October 2020.
+LEGACY_PARAMETER_FAMILY = "customEvent"
+LEGACY_PARAMETER_RE = re.compile(r"(?P<parameter>[^\[\]]+)\[(?P<event>[^\[\]]+)\]")
 
 
 class AnalyticsError(RuntimeError):
@@ -525,7 +553,7 @@ def api_request(
     payload: Optional[Dict[str, Any]] = None,
     retries: int = 2,
 ) -> Dict[str, Any]:
-    if not (url.startswith(ADMIN_BASE + "/") or url.startswith(DATA_BASE + "/")):
+    if not any(url.startswith(base + "/") for base in (ADMIN_BASE, DATA_BASE, FUNNEL_DATA_BASE)):
         raise AnalyticsError("Refused an unexpected Google Analytics API origin.")
     if params:
         encoded = urllib.parse.urlencode(params, doseq=True)
@@ -559,7 +587,7 @@ def resource_id(value: Any, prefix: str) -> str:
     cleaned = value.strip()
     if cleaned.startswith(prefix + "/"):
         cleaned = cleaned.split("/", 1)[1]
-    if not cleaned.isdigit():
+    if NUMERIC_ID_RE.fullmatch(cleaned) is None:
         raise AnalyticsError(f"Expected a numeric {prefix[:-1]} ID, got {value!r}.")
     return cleaned
 
@@ -615,6 +643,11 @@ def emit_json(value: Any) -> None:
 def warn_truncated(truncated: bool, limit: int) -> None:
     if truncated:
         print(f"WARNING: Results were truncated at --limit {limit}.", file=sys.stderr)
+
+
+def warn_possibly_truncated(possible: bool, limit: int) -> None:
+    if possible:
+        print(f"WARNING: Results may be truncated at --limit {limit}.", file=sys.stderr)
 
 
 def response_row_count(response: Dict[str, Any], returned: int) -> int:
@@ -706,9 +739,55 @@ def dimension_metric_names(args: argparse.Namespace) -> Tuple[List[str], List[st
             f"Google Analytics reports support at most {MAX_DIMENSIONS} dimensions and {MAX_METRICS} metrics."
         )
     for value in dimensions + metrics:
-        if not FIELD_NAME_RE.fullmatch(value):
+        if not valid_field_name(value):
             raise AnalyticsError(f"Invalid Analytics field name: {value!r}.")
     return dimensions, metrics
+
+
+def valid_name_component(value: str, maximum: int = MAX_GA4_NAME) -> bool:
+    """A Unicode letter-led GA identifier component without punctuation or whitespace.
+
+    Unicode-aware because GA4 accepts non-English event, parameter, and user-property names, so an
+    ASCII-only rule would refuse names Google itself collects.
+    """
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= maximum
+        and value[0].isalpha()
+        and all(character.isalnum() or character == "_" for character in value[1:])
+    )
+
+
+def valid_field_name(value: str) -> bool:
+    """A standard field name, or one of the Data API's documented custom field forms.
+
+    **Only a documented family may carry a colon.** The suffix is not a free-form string Google
+    happens to accept: each family declares what follows the colon, so `customEvent:` takes a
+    parameter name, `userKeyEventRate:` an event name, and `sessionCustomChannelGroup:` a numeric
+    channel ID — which a letter-led rule would refuse. Anything outside this table is rejected here
+    rather than sent, so an unrecognized spelling cannot reach a request body as a field name.
+    """
+    if not isinstance(value, str):
+        return False
+    base, colon, suffix = value.partition(":")
+    if BASE_FIELD_NAME_RE.fullmatch(base) is None:
+        return False
+    if not colon:
+        return True
+    kind = CUSTOM_FIELD_SUFFIXES.get(base)
+    if kind is None:
+        return False
+    if kind == "channel":
+        return NUMERIC_ID_RE.fullmatch(suffix) is not None
+    # An event-scoped custom dimension registered before October 2020 is only addressable with its
+    # event name in brackets, so that spelling is a documented form rather than a malformed one.
+    if base == LEGACY_PARAMETER_FAMILY:
+        legacy = LEGACY_PARAMETER_RE.fullmatch(suffix)
+        if legacy is not None:
+            return valid_name_component(legacy.group("parameter")) and valid_name_component(
+                legacy.group("event")
+            )
+    return valid_name_component(suffix)
 
 
 def normalized_report(response: Dict[str, Any], dimensions: List[str], metrics: List[str], access: Access, property_id: str) -> List[Dict[str, Any]]:
@@ -750,6 +829,8 @@ def command_report(args: argparse.Namespace) -> None:
     response = api_request(access.token(), "POST", f"{DATA_BASE}/properties/{property_id}:runReport", payload=payload)
     rows = normalized_report(response, dimensions, metrics, access, property_id)
     emit_report(rows, dimensions, metrics, args)
+    processing_notices(args.end_date, metrics)
+    report_notices(response, metrics)
     warn_truncated(response_row_count(response, len(rows)) > len(rows), limit)
 
 
@@ -775,10 +856,12 @@ def command_realtime(args: argparse.Namespace) -> None:
 # These commands report what a property already collects; a property that never sent
 # ecommerce or key events returns empty rows rather than an error.
 
-DATE_FORM_RE = re.compile(r"\d{4}-\d{2}-\d{2}|today|yesterday|\d+daysAgo")
-# GA4 event names: start with a letter, then letters, digits, or underscores, max 40.
-EVENT_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,39}")
+# ASCII digits and a bounded day count, for the same reason resource IDs are: `\d` also matches
+# Unicode digits Google cannot read, and an unbounded run of them is a caller-chosen request size.
+DATE_FORM_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}|today|yesterday|[0-9]{1,5}daysAgo")
+DAYS_AGO_RE = re.compile(r"([0-9]{1,5})daysAgo")
 MAX_EVENT_FILTER_VALUES = 25
+TRAFFIC_SEGMENT_CHOICES = ("all", "organic-search", "google-organic")
 
 TRAFFIC_METRICS = (
     "sessions",
@@ -803,9 +886,39 @@ AUDIENCE_METRICS = (
     "totalRevenue",
 )
 KEY_EVENT_METRICS = ("keyEvents", "eventCount", "activeUsers", "totalRevenue")
-ITEM_METRICS = ("itemsViewed", "itemsAddedToCart", "itemsCheckedOut", "itemsPurchased", "itemRevenue")
-PURCHASE_METRICS = ("ecommercePurchases", "purchaseRevenue", "totalRevenue")
-REVENUE_METRICS = frozenset({"totalRevenue", "purchaseRevenue", "itemRevenue"})
+LEAD_LIFECYCLE_METRICS = ("eventCount", "activeUsers", "sessions")
+LEAD_LIFECYCLE_EVENTS = (
+    "generate_lead",
+    "working_lead",
+    "qualify_lead",
+    "disqualify_lead",
+    "close_convert_lead",
+    "close_unconvert_lead",
+)
+ITEM_METRICS = (
+    "itemsViewed",
+    "itemsAddedToCart",
+    "itemsCheckedOut",
+    "itemsPurchased",
+    "cartToViewRate",
+    "purchaseToViewRate",
+    "grossItemRevenue",
+    "itemRefundAmount",
+    "itemRevenue",
+)
+PURCHASE_METRICS = (
+    "ecommercePurchases",
+    "grossPurchaseRevenue",
+    "refundAmount",
+    "purchaseRevenue",
+    "totalRevenue",
+    "totalPurchasers",
+    "purchaserRate",
+)
+REVENUE_METRICS = frozenset({
+    "totalRevenue", "grossPurchaseRevenue", "refundAmount", "purchaseRevenue",
+    "grossItemRevenue", "itemRefundAmount", "itemRevenue",
+})
 DERIVED_METRIC_EXPRESSIONS = {
     "averageEngagementTimePerSession": "userEngagementDuration/sessions",
 }
@@ -854,6 +967,20 @@ KEY_EVENT_DIMENSIONS = {
     "event": ("eventName",),
     "date": ("date",),
     "channel": ("sessionDefaultChannelGroup",),
+}
+LEAD_LIFECYCLE_DIMENSIONS = KEY_EVENT_DIMENSIONS
+
+# Only ecommerce ships as a funnel: Google publishes that step order with the events. The
+# recommended-events table names the lead lifecycle events but no order for them, so a lead
+# funnel would encode an ordering Google never stated. `lead-lifecycle` reports them unordered.
+FUNNEL_CHOICES = ("ecommerce",)
+FUNNEL_STEPS = {
+    "ecommerce": (
+        ("View item", "view_item"),
+        ("Add to cart", "add_to_cart"),
+        ("Begin checkout", "begin_checkout"),
+        ("Purchase", "purchase"),
+    ),
 }
 
 COMMERCE_BREAKDOWN_CHOICES = ("item", "item-id", "brand", "category", "list", "date", "channel")
@@ -910,7 +1037,7 @@ def validated_fields(dimensions: Sequence[str], metrics: Sequence[str]) -> None:
             f"Google Analytics reports support at most {MAX_DIMENSIONS} dimensions and {MAX_METRICS} metrics."
         )
     for value in list(dimensions) + list(metrics):
-        if not FIELD_NAME_RE.fullmatch(value):
+        if not valid_field_name(value):
             raise AnalyticsError(f"Invalid Analytics field name: {value!r}.")
 
 
@@ -938,7 +1065,7 @@ def event_name_filter(names: Sequence[str]) -> Dict[str, Any]:
     if len(names) > MAX_EVENT_FILTER_VALUES:
         raise AnalyticsError(f"--event accepts at most {MAX_EVENT_FILTER_VALUES} event names.")
     for name in names:
-        if not EVENT_NAME_RE.fullmatch(name):
+        if not valid_name_component(name, maximum=40):
             raise AnalyticsError(
                 f"Invalid GA4 event name: {name!r}. Event names start with a letter and use letters, digits, or underscores."
             )
@@ -949,6 +1076,41 @@ def all_of(expressions: List[Dict[str, Any]]) -> Dict[str, Any]:
     if len(expressions) == 1:
         return expressions[0]
     return {"andGroup": {"expressions": expressions}}
+
+
+def traffic_segment_filter(segment: str, scope: str = "session") -> Optional[Dict[str, Any]]:
+    """A fixed acquisition subset; arbitrary caller-supplied filters stay out of bounded reports."""
+    if segment == "all":
+        return None
+    prefix = "firstUser" if scope == "first-user" else "session"
+    if segment == "organic-search":
+        return {
+            "filter": {
+                "fieldName": prefix + "DefaultChannelGroup",
+                "stringFilter": {"matchType": "EXACT", "value": "Organic Search"},
+            }
+        }
+    if segment == "google-organic":
+        return all_of([
+            {
+                "filter": {
+                    "fieldName": prefix + "Source",
+                    "stringFilter": {"matchType": "EXACT", "value": "google"},
+                }
+            },
+            {
+                "filter": {
+                    "fieldName": prefix + "Medium",
+                    "stringFilter": {"matchType": "EXACT", "value": "organic"},
+                }
+            },
+        ])
+    raise AnalyticsError(f"Unsupported traffic segment: {segment!r}.")
+
+
+def combine_filters(*filters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    expressions = [one for one in filters if one is not None]
+    return all_of(expressions) if expressions else None
 
 
 def positive_metric_filter(metric: str) -> Dict[str, Any]:
@@ -985,6 +1147,38 @@ def report_notices(response: Dict[str, Any], metrics: Sequence[str]) -> None:
     currency = metadata.get("currencyCode")
     if isinstance(currency, str) and currency and any(metric in REVENUE_METRICS for metric in metrics):
         print(f"NOTE: Revenue is reported in {currency}.", file=sys.stderr)
+
+
+def ends_today(end_date: str) -> bool:
+    """Whether a window runs to today under any spelling the Data API's DateRange documents.
+
+    **`NdaysAgo` counts back from today, so `0daysAgo` is today under another name** and carries
+    exactly the same processing caveat. Matching only the literal `today` left the freshest window
+    a caller can ask for as the one window that went out unwarned.
+
+    A literal `YYYY-MM-DD` that happens to be today is deliberately not resolved: "today" is today
+    in the property's own reporting time zone, which this command never learns, so guessing it from
+    the local clock would warn — or stay silent — on the wrong day either side of the boundary.
+    """
+    if end_date == "today":
+        return True
+    days = DAYS_AGO_RE.fullmatch(end_date or "")
+    return days is not None and int(days.group(1)) == 0
+
+
+def processing_notices(end_date: str, metrics: Sequence[str]) -> None:
+    """State temporal limits that Google cannot encode in report response metadata."""
+    if ends_today(end_date):
+        print(
+            "NOTE: Today's data can be incomplete while Google Analytics processes events; "
+            "standard reports can take 24–48 hours to settle.",
+            file=sys.stderr,
+        )
+    if "keyEvents" in metrics:
+        print(
+            "NOTE: Attributed and modeled key-event results can change for up to 12 days.",
+            file=sys.stderr,
+        )
 
 
 def run_breakdown_report(
@@ -1026,6 +1220,7 @@ def run_breakdown_report(
     emit_report(rows, dimensions, metrics, args)
     for note in notes:
         print(f"NOTE: {note}", file=sys.stderr)
+    processing_notices(args.end_date, metrics)
     report_notices(response, metrics)
     warn_truncated(response_row_count(response, len(rows)) > len(rows), limit)
 
@@ -1036,7 +1231,11 @@ def command_traffic(args: argparse.Namespace) -> None:
         raise AnalyticsError(
             f"--breakdown {args.breakdown} has no {args.scope} form; run it with --scope session."
         )
-    run_breakdown_report(args, build_breakdown(dimensions, TRAFFIC_METRICS, "sessions"))
+    run_breakdown_report(
+        args,
+        build_breakdown(dimensions, TRAFFIC_METRICS, "sessions"),
+        dimension_filter=traffic_segment_filter(getattr(args, "segment", "all"), args.scope),
+    )
 
 
 def command_audience(args: argparse.Namespace) -> None:
@@ -1047,7 +1246,12 @@ def command_audience(args: argparse.Namespace) -> None:
             "Google applies aggregation thresholds to age and gender, and reports them only for "
             "properties that enabled Google signals.",
         )
-    run_breakdown_report(args, breakdown, notes=notes)
+    run_breakdown_report(
+        args,
+        breakdown,
+        dimension_filter=traffic_segment_filter(getattr(args, "segment", "all")),
+        notes=notes,
+    )
 
 
 def command_key_events(args: argparse.Namespace) -> None:
@@ -1055,7 +1259,33 @@ def command_key_events(args: argparse.Namespace) -> None:
     expressions = [key_event_filter()]
     if args.event is not None:
         expressions.append(event_name_filter(split_csv(args.event)))
-    run_breakdown_report(args, breakdown, dimension_filter=all_of(expressions))
+    run_breakdown_report(
+        args,
+        breakdown,
+        dimension_filter=combine_filters(
+            all_of(expressions),
+            traffic_segment_filter(getattr(args, "segment", "all")),
+        ),
+    )
+
+
+def command_lead_lifecycle(args: argparse.Namespace) -> None:
+    """Report Google's recommended lead states even when they are not property key events."""
+    breakdown = build_breakdown(
+        LEAD_LIFECYCLE_DIMENSIONS[args.breakdown], LEAD_LIFECYCLE_METRICS, "eventCount"
+    )
+    run_breakdown_report(
+        args,
+        breakdown,
+        dimension_filter=combine_filters(
+            event_name_filter(LEAD_LIFECYCLE_EVENTS),
+            traffic_segment_filter(getattr(args, "segment", "all")),
+        ),
+        notes=(
+            "Lead lifecycle rows reflect events received by Analytics, not CRM truth; reconcile "
+            "them to the lead system of record.",
+        ),
+    )
 
 
 def command_commerce(args: argparse.Namespace) -> None:
@@ -1068,7 +1298,205 @@ def command_commerce(args: argparse.Namespace) -> None:
             COMMERCE_DIMENSIONS[args.breakdown], PURCHASE_METRICS, "purchaseRevenue", "ecommercePurchases"
         )
     metric_filter = positive_metric_filter(breakdown.purchase_metric) if args.purchased_only else None
-    run_breakdown_report(args, breakdown, metric_filter=metric_filter)
+    run_breakdown_report(
+        args,
+        breakdown,
+        dimension_filter=traffic_segment_filter(getattr(args, "segment", "all")),
+        metric_filter=metric_filter,
+    )
+
+
+def metadata_rows(response: Dict[str, Any], kind: str, query: str) -> List[Dict[str, Any]]:
+    """Normalize property-specific fields without hiding compatibility or deprecation metadata."""
+    wanted = (query or "").casefold()
+    groups = ("dimensions", "metrics") if kind == "all" else (kind,)
+    rows: List[Dict[str, Any]] = []
+    for group in groups:
+        singular = group[:-1]
+        for item in expect_objects(response, group, f"{singular} metadata"):
+            api_name = item.get("apiName", "")
+            if not isinstance(api_name, str) or not api_name:
+                raise AnalyticsError(f"Google Analytics returned malformed {singular} metadata.")
+            searchable = " ".join(
+                str(item.get(field, "")) for field in ("apiName", "uiName", "description", "category")
+            ).casefold()
+            if wanted and wanted not in searchable:
+                continue
+            deprecated = item.get("deprecatedApiNames", [])
+            blocked = item.get("blockedReasons", [])
+            if not isinstance(deprecated, list) or not all(isinstance(one, str) for one in deprecated):
+                raise AnalyticsError(f"Google Analytics returned malformed {singular} metadata.")
+            if not isinstance(blocked, list) or not all(isinstance(one, str) for one in blocked):
+                raise AnalyticsError(f"Google Analytics returned malformed {singular} metadata.")
+            rows.append({
+                "kind": singular,
+                "api_name": api_name,
+                "ui_name": item.get("uiName", ""),
+                "category": item.get("category", ""),
+                "type": item.get("type", ""),
+                "custom_definition": bool(item.get("customDefinition", False)),
+                "deprecated_api_names": ",".join(deprecated),
+                "blocked_reasons": ",".join(blocked),
+                "description": item.get("description", ""),
+            })
+    return rows
+
+
+def command_metadata(args: argparse.Namespace) -> None:
+    access = selected_access(args)
+    property_id = resource_id(args.property, "properties")
+    limit = bounded_limit(args.limit)
+    response = api_request(
+        access.token(), "GET", f"{DATA_BASE}/properties/{property_id}/metadata"
+    )
+    available = metadata_rows(response, args.kind, args.query)
+    rows = available[:limit]
+    for row in rows:
+        row["profile"] = access.name
+        row["property_id"] = property_id
+    headers = (
+        "kind", "api_name", "ui_name", "category", "type", "custom_definition",
+        "deprecated_api_names", "blocked_reasons", "description", "profile", "property_id",
+    )
+    if args.json:
+        emit_json(rows)
+    else:
+        emit_csv(headers, ([row.get(header, "") for header in headers] for row in rows))
+    warn_truncated(len(available) > len(rows), limit)
+
+
+def compatibility_rows(response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for kind, collection, metadata_key in (
+        ("dimension", "dimensionCompatibilities", "dimensionMetadata"),
+        ("metric", "metricCompatibilities", "metricMetadata"),
+    ):
+        for item in expect_objects(response, collection, f"{kind} compatibility"):
+            metadata = expect_object(item.get(metadata_key, {}), f"{kind} metadata")
+            api_name = metadata.get("apiName", "")
+            compatibility = item.get("compatibility", "")
+            if not isinstance(api_name, str) or not api_name or compatibility not in (
+                "COMPATIBLE", "INCOMPATIBLE", "COMPATIBILITY_UNSPECIFIED"
+            ):
+                raise AnalyticsError(f"Google Analytics returned malformed {kind} compatibility.")
+            rows.append({
+                "kind": kind,
+                "api_name": api_name,
+                "compatibility": compatibility,
+                "ui_name": metadata.get("uiName", ""),
+                "description": metadata.get("description", ""),
+            })
+    return rows
+
+
+def compatibility_notice() -> None:
+    """Say what the rows answer, because they are not a verdict on the fields that were sent.
+
+    Google's method "lists dimensions and metrics that can be added to a report request and
+    maintain compatibility" and "fails if the request's dimensions and metrics are incompatible".
+    Two consequences a caller cannot see in the rows: each row rates a *candidate* field against
+    the supplied context rather than the supplied combination, and a response arriving at all
+    already means that starting set was compatible. Google also documents that this method checks
+    Core reports only, and that Realtime reports have different compatibility rules.
+    """
+    print(
+        "NOTE: Each row says whether that field can be added to the supplied Core report context, "
+        "not whether the supplied combination is valid; Google refuses the whole request when the "
+        "supplied fields are already incompatible, so a returned table means they were not. "
+        "Realtime reports follow different compatibility rules and are not covered.",
+        file=sys.stderr,
+    )
+
+
+def command_compatibility(args: argparse.Namespace) -> None:
+    access = selected_access(args)
+    property_id = resource_id(args.property, "properties")
+    limit = bounded_limit(args.limit)
+    dimensions, metrics = dimension_metric_names(args)
+    payload: Dict[str, Any] = {
+        "dimensions": [{"name": name} for name in dimensions],
+        "metrics": [{"name": name} for name in metrics],
+    }
+    if args.compatibility != "all":
+        payload["compatibilityFilter"] = args.compatibility.upper()
+    response = api_request(
+        access.token(),
+        "POST",
+        f"{DATA_BASE}/properties/{property_id}:checkCompatibility",
+        payload=payload,
+    )
+    available = compatibility_rows(response)
+    rows = available[:limit]
+    for row in rows:
+        row["profile"] = access.name
+        row["property_id"] = property_id
+    headers = (
+        "kind", "api_name", "compatibility", "ui_name", "description", "profile", "property_id",
+    )
+    if args.json:
+        emit_json(rows)
+    else:
+        emit_csv(headers, ([row.get(header, "") for header in headers] for row in rows))
+    compatibility_notice()
+    warn_truncated(len(available) > len(rows), limit)
+
+
+def funnel_step(name: str, event_name: str) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "filterExpression": {"funnelEventFilter": {"eventName": event_name}},
+    }
+
+
+def normalized_funnel_table(
+    response: Dict[str, Any], access: Access, property_id: str
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], Dict[str, Any]]:
+    table = expect_object(response.get("funnelTable", {}), "funnel table")
+    dimension_headers = expect_objects(table, "dimensionHeaders", "funnel dimension header")
+    metric_headers = expect_objects(table, "metricHeaders", "funnel metric header")
+    dimensions = [item.get("name", "") for item in dimension_headers]
+    metrics = [item.get("name", "") for item in metric_headers]
+    if not dimensions or not metrics or not all(
+        isinstance(name, str) and name for name in dimensions + metrics
+    ):
+        raise AnalyticsError("Google Analytics returned malformed funnel headers.")
+    rows = normalized_report(table, dimensions, metrics, access, property_id)
+    metadata = expect_object(table.get("metadata", {}), "funnel metadata")
+    return dimensions, metrics, rows, metadata
+
+
+def command_funnel(args: argparse.Namespace) -> None:
+    """Run one fixed, closed, ordered funnel made from Google's recommended events."""
+    access = selected_access(args)
+    property_id = resource_id(args.property, "properties")
+    limit = bounded_limit(args.limit, 250000)
+    payload: Dict[str, Any] = {
+        "dateRanges": [{
+            "startDate": bounded_date(args.start_date, "--start-date"),
+            "endDate": bounded_date(args.end_date, "--end-date"),
+        }],
+        "funnel": {
+            "isOpenFunnel": False,
+            "steps": [funnel_step(name, event) for name, event in FUNNEL_STEPS[args.funnel]],
+        },
+        "limit": str(limit),
+    }
+    segment = traffic_segment_filter(getattr(args, "segment", "all"))
+    if segment is not None:
+        payload["dimensionFilter"] = segment
+    response = api_request(
+        access.token(),
+        "POST",
+        f"{FUNNEL_DATA_BASE}/properties/{property_id}:runFunnelReport",
+        payload=payload,
+    )
+    dimensions, metrics, rows, metadata = normalized_funnel_table(response, access, property_id)
+    emit_report(rows, dimensions, metrics, args)
+    processing_notices(args.end_date, ())
+    if expect_objects(metadata, "samplingMetadatas", "sampling metadata"):
+        print("WARNING: Google sampled this funnel; values are estimates.", file=sys.stderr)
+    print("NOTE: Funnel reporting uses Google's alpha Data API surface.", file=sys.stderr)
+    warn_possibly_truncated(len(rows) >= limit, limit)
 
 
 def add_profile_option(parser: argparse.ArgumentParser) -> None:
@@ -1083,6 +1511,15 @@ def add_report_window(parser: argparse.ArgumentParser, default_limit: int) -> No
     parser.add_argument("--start-date", default="28daysAgo", help="YYYY-MM-DD, today, yesterday, or NdaysAgo")
     parser.add_argument("--end-date", default="today", help="YYYY-MM-DD, today, yesterday, or NdaysAgo")
     parser.add_argument("--limit", type=int, default=default_limit)
+
+
+def add_traffic_segment(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--segment",
+        choices=TRAFFIC_SEGMENT_CHOICES,
+        default="all",
+        help="All traffic, all Organic Search, or specifically google / organic",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1130,14 +1567,16 @@ def build_parser() -> argparse.ArgumentParser:
     traffic.add_argument("--breakdown", choices=TRAFFIC_BREAKDOWN_CHOICES, default="channel")
     traffic.add_argument(
         "--scope", choices=TRAFFIC_SCOPE_CHOICES, default="session",
-        help="Attribute to the session or to the user's first visit",
+        help="Group by session acquisition or by the user's first acquisition",
     )
+    add_traffic_segment(traffic)
     traffic.set_defaults(handler=command_traffic)
 
     audience = subparsers.add_parser("audience", help="Report aggregated audience, geography, and technology")
     add_profile_option(audience)
     add_report_window(audience, 25)
     audience.add_argument("--breakdown", choices=AUDIENCE_BREAKDOWN_CHOICES, default="country")
+    add_traffic_segment(audience)
     audience.set_defaults(handler=command_audience)
 
     key_events = subparsers.add_parser("key-events", help="Report key events, the GA4 name for conversions and leads")
@@ -1145,7 +1584,20 @@ def build_parser() -> argparse.ArgumentParser:
     add_report_window(key_events, 25)
     key_events.add_argument("--breakdown", choices=KEY_EVENT_BREAKDOWN_CHOICES, default="event")
     key_events.add_argument("--event", help="Comma-separated GA4 event names to isolate")
+    add_traffic_segment(key_events)
     key_events.set_defaults(handler=command_key_events)
+
+    lead_lifecycle = subparsers.add_parser(
+        "lead-lifecycle",
+        help="Report Google's recommended lead lifecycle and disposition events",
+    )
+    add_profile_option(lead_lifecycle)
+    add_report_window(lead_lifecycle, 25)
+    lead_lifecycle.add_argument(
+        "--breakdown", choices=KEY_EVENT_BREAKDOWN_CHOICES, default="event"
+    )
+    add_traffic_segment(lead_lifecycle)
+    lead_lifecycle.set_defaults(handler=command_lead_lifecycle)
 
     commerce = subparsers.add_parser("commerce", help="Report ecommerce item, purchase, and revenue behavior")
     add_profile_option(commerce)
@@ -1154,7 +1606,54 @@ def build_parser() -> argparse.ArgumentParser:
     commerce.add_argument(
         "--purchased-only", action="store_true", help="Drop rows with no purchase in the window",
     )
+    add_traffic_segment(commerce)
     commerce.set_defaults(handler=command_commerce)
+
+    funnel = subparsers.add_parser(
+        "funnel", help="Run the fixed ordered ecommerce funnel"
+    )
+    add_profile_option(funnel)
+    add_report_window(funnel, 25)
+    funnel.add_argument("--funnel", choices=FUNNEL_CHOICES, default="ecommerce")
+    add_traffic_segment(funnel)
+    funnel.set_defaults(handler=command_funnel)
+
+    metadata = subparsers.add_parser(
+        "metadata", help="List report fields available to one GA4 property"
+    )
+    add_profile_option(metadata)
+    metadata.add_argument("--property", required=True, help="Numeric GA4 property ID")
+    metadata.add_argument("--kind", choices=("all", "dimensions", "metrics"), default="all")
+    metadata.add_argument("--query", default="", help="Case-insensitive name or description search")
+    metadata.add_argument("--limit", type=int, default=100)
+    metadata.set_defaults(handler=command_metadata)
+
+    compatibility = subparsers.add_parser(
+        "compatibility",
+        help="List Core report fields that can be added to the supplied dimensions and metrics",
+        description=(
+            "List the Core report dimensions and metrics that can be added to the supplied fields "
+            "while staying compatible. The supplied fields are the starting report context, not "
+            "the thing being rated: Google refuses the request outright when they are already "
+            "incompatible with each other. Realtime reports have different rules."
+        ),
+    )
+    add_profile_option(compatibility)
+    compatibility.add_argument("--property", required=True, help="Numeric GA4 property ID")
+    compatibility.add_argument(
+        "--metrics", default="sessions,activeUsers",
+        help="Metrics of the Core report to use as the starting context",
+    )
+    compatibility.add_argument(
+        "--dimensions", default="date",
+        help="Dimensions of the Core report to use as the starting context",
+    )
+    compatibility.add_argument(
+        "--compatibility", choices=("all", "compatible", "incompatible"), default="all",
+        help="Restrict the candidate fields Google returns to one compatibility",
+    )
+    compatibility.add_argument("--limit", type=int, default=25)
+    compatibility.set_defaults(handler=command_compatibility)
 
     return parser
 
