@@ -99,6 +99,7 @@ README_ANCHORS = (
     ".github/ISSUE_TEMPLATE/change-proposal.md",
     ".github/pull_request_template.md",
     "python3 skills/google-search-console/scripts/google-search-console.d/test-google-search-console.py -q",
+    "python3 skills/google-analytics/scripts/google-analytics.d/test-google-analytics.py -q",
     "python3 skills/google-crux/scripts/google-crux.d/test-google-crux.py -q",
     '(cd /tmp && "$repository_root/skills/google-search-console/scripts/google-search-console" --help)',
     '(cd /tmp && "$repository_root/skills/google-crux/scripts/google-crux" --help)',
@@ -331,6 +332,133 @@ class GoogleCatalog(unittest.TestCase):
                 with self.subTest(path=path.relative_to(ROOT)):
                     text = path.read_text(encoding="utf-8", errors="ignore")
                     self.assertFalse(any(value.lower() in text.lower() for value in forbidden))
+
+
+class GoogleAnalyticsMeasurementGuidance(unittest.TestCase):
+    """The published GA skill keeps its SEO measurement method tied to executable commands."""
+
+    def setUp(self):
+        self.package = ROOT / "skills" / "google-analytics"
+
+    def test_measurement_guidance_names_the_evidence_order_and_system_boundaries(self):
+        measurement = (self.package / "references" / "measurement.md").read_text(encoding="utf-8")
+        compact = " ".join(measurement.split())
+        ordered_gates = (
+            "Establish the baseline", "Resolve quality and technical red flags",
+            "Build growth plans", "Expand content only after the first three gates",
+        )
+        self.assertEqual(
+            sorted(compact.index(gate) for gate in ordered_gates),
+            [compact.index(gate) for gate in ordered_gates],
+        )
+        for required in (
+            *ordered_gates,
+            "Google Search impressions and clicks from Search Console",
+            "GA4 does not produce an SEO quality score",
+            "Search Console as the source of truth", "GA4 is not the lead system of record",
+            "not proof that organic traffic caused an outcome",
+            "Aggregate event counts are not a funnel",
+            "measurement repair as the first action",
+            "recommended lead event list does not establish a canonical funnel order",
+            "business's documented local stage sequence",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, compact)
+
+    def test_every_measurement_command_is_exposed_by_the_parser(self):
+        command_path = self.package / "scripts" / "google-analytics"
+        skill = (self.package / "SKILL.md").read_text(encoding="utf-8")
+        cli = (self.package / "references" / "cli.md").read_text(encoding="utf-8")
+        commands = (
+            "traffic", "audience", "key-events", "lead-lifecycle", "commerce", "funnel",
+            "metadata", "compatibility",
+        )
+        top_help = subprocess.run(
+            [str(command_path), "--help"], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(0, top_help.returncode, top_help.stdout + top_help.stderr)
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIn(f"google-analytics {command}", skill)
+                self.assertIn(f"google-analytics {command}", cli)
+                self.assertIn(command, top_help.stdout)
+
+        option_contracts = {
+            "traffic": ("--breakdown", "--scope", "--segment", "--start-date", "--end-date"),
+            "audience": ("--breakdown", "--segment", "--start-date", "--end-date"),
+            "key-events": ("--breakdown", "--event", "--segment"),
+            "lead-lifecycle": ("--breakdown", "--segment"),
+            "commerce": ("--breakdown", "--purchased-only", "--segment"),
+            "funnel": ("--funnel", "--segment", "--start-date", "--end-date"),
+            "metadata": ("--kind", "--query", "--limit"),
+            "compatibility": ("--dimensions", "--metrics", "--compatibility", "--limit"),
+        }
+        for command, options in option_contracts.items():
+            with self.subTest(command_help=command):
+                completed = subprocess.run(
+                    [str(command_path), command, "--help"],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+                for option in options:
+                    self.assertIn(option, completed.stdout)
+
+    def test_compatibility_guidance_preserves_the_contextual_api_contract(self):
+        skill = " ".join((self.package / "SKILL.md").read_text(encoding="utf-8").split())
+        cli = " ".join(
+            (self.package / "references" / "cli.md").read_text(encoding="utf-8").split()
+        )
+        self.assertIn("lists fields that could be added", skill)
+        self.assertIn("lists other fields that can or cannot be added", cli)
+        for text in (skill, cli):
+            self.assertIn("starting", text)
+            self.assertIn("already incompatible", text)
+            self.assertNotIn("checks the exact", text)
+
+    def test_cli_documents_supported_property_field_forms_and_guardrail(self):
+        cli = " ".join(
+            (self.package / "references" / "cli.md").read_text(encoding="utf-8").split()
+        )
+        for field in (
+            "customEvent:lead_score",
+            "customEvent:lead_score[generate_lead]",
+            "sessionKeyEventRate:generate_lead",
+            "sessionCustomChannelGroup:9432931",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, cli)
+        for refusal in ("unknown colon family", "malformed bracket suffix", "non-ASCII custom-channel ID"):
+            with self.subTest(refusal=refusal):
+                self.assertIn(refusal, cli)
+
+    def test_docs_do_not_infer_an_ordered_funnel_from_recommended_lead_events(self):
+        published = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                ROOT / "README.md",
+                ROOT / "docs" / "concepts" / "lexicon.md",
+                self.package / "SKILL.md",
+                self.package / "references" / "cli.md",
+                self.package / "references" / "measurement.md",
+            )
+        )
+        self.assertNotIn("--funnel lead", published)
+        self.assertNotRegex(published, r"(?i)ordered [`]*(?:lead|lead lifecycle) funnel")
+        self.assertIn("Google publishes no canonical sequence", published)
+        self.assertIn("explicitly documented local stage order", published)
+
+    def test_sources_are_official_and_the_retired_event_url_is_gone(self):
+        sources = (self.package / "references" / "sources.md").read_text(encoding="utf-8")
+        self.assertNotIn("answer/13316687", sources)
+        urls = re.findall(r"https://[^)]+", sources)
+        self.assertGreaterEqual(len(urls), 20)
+        self.assertEqual(len(urls), len(set(urls)))
+        for url in urls:
+            with self.subTest(url=url):
+                self.assertTrue(
+                    url.startswith("https://developers.google.com/")
+                    or url.startswith("https://support.google.com/")
+                )
 
 
 class GoogleSignInGuidance(unittest.TestCase):

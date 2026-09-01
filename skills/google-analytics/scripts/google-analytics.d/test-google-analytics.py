@@ -298,6 +298,7 @@ class ReportFamilyTest(unittest.TestCase):
             limit=25,
             json=True,
             scope="session",
+            segment="all",
             event=None,
             purchased_only=False,
         )
@@ -479,6 +480,85 @@ class ReportFamilyTest(unittest.TestCase):
             captured["payload"]["dimensionFilter"],
         )
 
+    def test_organic_search_segment_is_available_across_bounded_report_families(self):
+        for handler, breakdown in (
+            (self.module.command_traffic, "landing-page"),
+            (self.module.command_audience, "country"),
+            (self.module.command_key_events, "event"),
+            (self.module.command_lead_lifecycle, "event"),
+            (self.module.command_commerce, "channel"),
+        ):
+            with self.subTest(handler=handler.__name__):
+                captured, _, _ = self.run_report(
+                    handler, breakdown=breakdown, segment="organic-search"
+                )
+                serialized = json.dumps(captured["payload"]["dimensionFilter"], sort_keys=True)
+                self.assertIn("sessionDefaultChannelGroup", serialized)
+                self.assertIn("Organic Search", serialized)
+
+    def test_google_organic_segment_requires_google_source_and_organic_medium(self):
+        captured, _, _ = self.run_report(
+            self.module.command_traffic,
+            breakdown="landing-page",
+            segment="google-organic",
+        )
+        expression = captured["payload"]["dimensionFilter"]
+        self.assertEqual(
+            ["sessionSource", "sessionMedium"],
+            [one["filter"]["fieldName"] for one in expression["andGroup"]["expressions"]],
+        )
+        self.assertEqual(
+            ["google", "organic"],
+            [
+                one["filter"]["stringFilter"]["value"]
+                for one in expression["andGroup"]["expressions"]
+            ],
+        )
+
+    def test_first_user_organic_segment_uses_first_user_acquisition_fields(self):
+        captured, _, _ = self.run_report(
+            self.module.command_traffic,
+            breakdown="channel",
+            scope="first-user",
+            segment="organic-search",
+        )
+        self.assertEqual(
+            "firstUserDefaultChannelGroup",
+            captured["payload"]["dimensionFilter"]["filter"]["fieldName"],
+        )
+
+    def test_lead_lifecycle_does_not_require_events_to_be_key_events(self):
+        captured, _, errors = self.run_report(
+            self.module.command_lead_lifecycle, breakdown="event"
+        )
+        dimension_filter = captured["payload"]["dimensionFilter"]
+        self.assertEqual(
+            list(self.module.LEAD_LIFECYCLE_EVENTS),
+            dimension_filter["filter"]["inListFilter"]["values"],
+        )
+        self.assertNotIn("isKeyEvent", json.dumps(dimension_filter))
+        self.assertEqual(
+            [{"name": "eventCount"}, {"name": "activeUsers"}, {"name": "sessions"}],
+            captured["payload"]["metrics"],
+        )
+        self.assertIn("CRM truth", errors)
+
+    def test_unicode_event_names_and_colon_fields_follow_google_forms(self):
+        event_filter = self.module.event_name_filter(["購入完了", "lead_éxito"])
+        self.assertEqual(
+            ["購入完了", "lead_éxito"], event_filter["filter"]["inListFilter"]["values"]
+        )
+        for field in (
+            "customEvent:lead_éxito",
+            "sessionKeyEventRate:購入完了",
+            "country",
+        ):
+            with self.subTest(field=field):
+                self.assertTrue(self.module.valid_field_name(field))
+        for field in ("customEvent:", "customEvent:a:b", "date;drop", "customEvent:a b"):
+            with self.subTest(field=field):
+                self.assertFalse(self.module.valid_field_name(field))
+
     def test_invalid_or_unbounded_event_names_are_refused(self):
         for value in ("", ",", " , "):
             with self.subTest(event=value):
@@ -491,6 +571,101 @@ class ReportFamilyTest(unittest.TestCase):
         crowd = ",".join(f"event_{index}" for index in range(self.module.MAX_EVENT_FILTER_VALUES + 1))
         with self.assertRaisesRegex(self.module.AnalyticsError, "at most"):
             self.run_report(self.module.command_key_events, breakdown="event", event=crowd)
+
+    # Quoted from the Data API schema page's "Custom dimensions", "Custom metrics", "Custom
+    # channel groups", and key-event-rate tables, so the expectation comes from Google rather than
+    # from the table the module happens to carry.
+    DOCUMENTED_CUSTOM_FIELDS = (
+        "customEvent:achievement_id",
+        "customEvent:achievement_id[level_up]",
+        "customUser:last_level",
+        "customItem:parameter_name",
+        "averageCustomEvent:credits_spent",
+        "countCustomEvent:credits_spent",
+        "sessionKeyEventRate:generate_lead",
+        "userKeyEventRate:購入完了",
+        "sessionCustomChannelGroup:9432931",
+        "firstUserCustomChannelGroup:9432931",
+        "customChannelGroup:9432931",
+    )
+
+    def test_every_documented_custom_field_form_is_accepted(self):
+        for field in self.DOCUMENTED_CUSTOM_FIELDS:
+            with self.subTest(field=field):
+                self.assertTrue(self.module.valid_field_name(field))
+
+    def test_a_suffix_outside_the_documented_forms_is_refused(self):
+        for field in (
+            "date:9432931",                         # a published dimension takes no suffix at all
+            "customChannel:9432931",                # not a family Google publishes
+            "keyEvents:generate_lead",              # only the two rate metrics take an event name
+            "customEvent:9432931",                  # a parameter name is letter-led, never an ID
+            "sessionCustomChannelGroup:default",    # a custom channel is addressed by numeric ID
+            "sessionCustomChannelGroup:٩٤٣٢٩٣١",     # Unicode digits Google cannot read
+            "sessionCustomChannelGroup:",
+            "userKeyEventRate:1lead",
+            "customEvent:[level_up]",
+            "customEvent:achievement_id[]",
+            "customEvent:achievement_id[level up]",
+            "customEvent:achievement_id[level_up][again]",
+            "customEvent:achievement_id[level_up] OR 1=1",
+            "customEvent:lead\nscore",
+            "customEvent:" + "a" * 41,
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(self.module.valid_field_name(field))
+
+    def run_free_report(self, dimensions, metrics):
+        """One `report` call, so a field form is proved where it lands rather than in a predicate."""
+        args = SimpleNamespace(
+            profile="example", property="456", start_date="28daysAgo", end_date="yesterday",
+            metrics=metrics, dimensions=dimensions, limit=5, json=True,
+        )
+        captured = {}
+
+        def fake_request(token, method, url, params=None, payload=None, retries=2):
+            captured["payload"] = payload
+            return {"rowCount": 0, "rows": []}
+
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
+            self.module, "api_request", side_effect=fake_request
+        ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.module.command_report(args)
+        return captured
+
+    def test_a_custom_channel_group_reaches_the_request_and_an_invented_family_does_not(self):
+        captured = self.run_free_report(
+            "sessionCustomChannelGroup:9432931", "customEvent:credits_spent"
+        )
+        self.assertEqual(
+            [{"name": "sessionCustomChannelGroup:9432931"}], captured["payload"]["dimensions"]
+        )
+        self.assertEqual([{"name": "customEvent:credits_spent"}], captured["payload"]["metrics"])
+        with self.assertRaisesRegex(self.module.AnalyticsError, "Invalid Analytics field name"):
+            self.run_free_report("sessionChannelGroup:9432931", "sessions")
+
+    def test_a_window_ending_today_is_warned_under_every_documented_spelling(self):
+        for end_date in ("today", "0daysAgo", "00daysAgo"):
+            with self.subTest(end_date=end_date):
+                _, _, errors = self.run_report(
+                    self.module.command_traffic, breakdown="channel", end_date=end_date
+                )
+                self.assertIn("Today's data can be incomplete", errors)
+        for end_date in ("yesterday", "1daysAgo", "2026-08-17"):
+            with self.subTest(end_date=end_date):
+                _, _, errors = self.run_report(
+                    self.module.command_traffic, breakdown="channel", end_date=end_date
+                )
+                self.assertNotIn("Today's data can be incomplete", errors)
+
+    def test_identifiers_and_dates_are_ascii_digits_rather_than_anything_isdigit_accepts(self):
+        self.assertTrue("٤٥٦".isdigit())
+        with self.assertRaisesRegex(self.module.AnalyticsError, "numeric propert"):
+            self.run_report(self.module.command_audience, breakdown="country", property="٤٥٦")
+        with self.assertRaisesRegex(self.module.AnalyticsError, "--start-date must be"):
+            self.module.bounded_date("٢٨daysAgo", "--start-date")
+        with self.assertRaisesRegex(self.module.AnalyticsError, "--start-date must be"):
+            self.module.bounded_date("٢٠٢٦-٠٨-١٧", "--start-date")
 
     def test_commerce_item_breakdowns_use_item_scoped_metrics(self):
         for breakdown, dimension in (
@@ -509,6 +684,10 @@ class ReportFamilyTest(unittest.TestCase):
                         {"name": "itemsAddedToCart"},
                         {"name": "itemsCheckedOut"},
                         {"name": "itemsPurchased"},
+                        {"name": "cartToViewRate"},
+                        {"name": "purchaseToViewRate"},
+                        {"name": "grossItemRevenue"},
+                        {"name": "itemRefundAmount"},
                         {"name": "itemRevenue"},
                     ],
                     captured["payload"]["metrics"],
@@ -523,7 +702,15 @@ class ReportFamilyTest(unittest.TestCase):
                 captured, _, _ = self.run_report(self.module.command_commerce, breakdown=breakdown)
                 self.assertEqual([{"name": dimension}], captured["payload"]["dimensions"])
                 self.assertEqual(
-                    [{"name": "ecommercePurchases"}, {"name": "purchaseRevenue"}, {"name": "totalRevenue"}],
+                    [
+                        {"name": "ecommercePurchases"},
+                        {"name": "grossPurchaseRevenue"},
+                        {"name": "refundAmount"},
+                        {"name": "purchaseRevenue"},
+                        {"name": "totalRevenue"},
+                        {"name": "totalPurchasers"},
+                        {"name": "purchaserRate"},
+                    ],
                     captured["payload"]["metrics"],
                 )
 
@@ -545,6 +732,207 @@ class ReportFamilyTest(unittest.TestCase):
         captured, _, _ = self.run_report(self.module.command_commerce, breakdown="item")
         self.assertNotIn("metricFilter", captured["payload"])
         self.assertNotIn("dimensionFilter", captured["payload"])
+
+    def test_funnel_sends_a_closed_ordered_recommended_event_sequence(self):
+        args = SimpleNamespace(
+            profile="example", property="456", start_date="28daysAgo", end_date="yesterday",
+            limit=25, json=True, funnel="ecommerce", segment="google-organic",
+        )
+        captured = {}
+        response = {
+            "funnelTable": {
+                "dimensionHeaders": [{"name": "funnelStepName"}],
+                "metricHeaders": [
+                    {"name": "activeUsers", "type": "TYPE_INTEGER"},
+                    {"name": "funnelStepCompletionRate", "type": "TYPE_FLOAT"},
+                    {"name": "funnelStepAbandonments", "type": "TYPE_INTEGER"},
+                    {"name": "funnelStepAbandonmentRate", "type": "TYPE_FLOAT"},
+                ],
+                "rows": [{
+                    "dimensionValues": [{"value": "1. View item"}],
+                    "metricValues": [
+                        {"value": "100"}, {"value": "0.5"},
+                        {"value": "50"}, {"value": "0.5"},
+                    ],
+                }],
+                "metadata": {"samplingMetadatas": [{"samplesReadCount": "1000"}]},
+            }
+        }
+
+        def fake_request(token, method, url, params=None, payload=None, retries=2):
+            captured.update({"method": method, "url": url, "payload": payload})
+            return response
+
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
+            self.module, "api_request", side_effect=fake_request
+        ), redirect_stdout(output), redirect_stderr(errors):
+            self.module.command_funnel(args)
+        self.assertTrue(captured["url"].endswith("/v1alpha/properties/456:runFunnelReport"))
+        self.assertFalse(captured["payload"]["funnel"]["isOpenFunnel"])
+        self.assertEqual(
+            ["view_item", "add_to_cart", "begin_checkout", "purchase"],
+            [
+                step["filterExpression"]["funnelEventFilter"]["eventName"]
+                for step in captured["payload"]["funnel"]["steps"]
+            ],
+        )
+        self.assertIn("sessionSource", json.dumps(captured["payload"]["dimensionFilter"]))
+        row = json.loads(output.getvalue())[0]
+        self.assertEqual("1. View item", row["funnelStepName"])
+        self.assertEqual("0.5", row["funnelStepAbandonmentRate"])
+        self.assertIn("sampled", errors.getvalue())
+
+    def test_funnel_refuses_malformed_headers(self):
+        response = {"funnelTable": {"dimensionHeaders": [], "metricHeaders": [], "rows": []}}
+        with self.assertRaisesRegex(self.module.AnalyticsError, "malformed funnel headers"):
+            self.module.normalized_funnel_table(response, self.access, "456")
+
+    def test_funnel_offers_only_the_sequence_google_publishes_an_order_for(self):
+        # A lead funnel would have to invent step order Google never published, so none is offered.
+        self.assertEqual(("ecommerce",), self.module.FUNNEL_CHOICES)
+        self.assertEqual(set(self.module.FUNNEL_CHOICES), set(self.module.FUNNEL_STEPS))
+        parser = self.module.build_parser()
+        with self.assertRaises(SystemExit) as refused, redirect_stderr(io.StringIO()) as errors:
+            parser.parse_args(["funnel", "--property", "456", "--funnel", "lead"])
+        self.assertEqual(2, refused.exception.code)
+        self.assertIn("invalid choice", errors.getvalue())
+        help_text = io.StringIO()
+        with self.assertRaises(SystemExit) as helped, redirect_stdout(help_text):
+            parser.parse_args(["funnel", "--help"])
+        self.assertEqual(0, helped.exception.code)
+        self.assertIn("--funnel {ecommerce}", help_text.getvalue())
+        self.assertNotIn("lead", help_text.getvalue())
+
+    def test_metadata_lists_property_specific_custom_fields_and_bounds_output(self):
+        args = SimpleNamespace(
+            profile="example", property="456", kind="metrics", query="lead", limit=1, json=True
+        )
+        response = {
+            "dimensions": [],
+            "metrics": [
+                {
+                    "apiName": "customEvent:lead_score",
+                    "uiName": "Lead score",
+                    "description": "Captured lead quality score",
+                    "category": "Custom",
+                    "type": "TYPE_FLOAT",
+                    "customDefinition": True,
+                    "deprecatedApiNames": [],
+                    "blockedReasons": [],
+                },
+                {
+                    "apiName": "sessionKeyEventRate:generate_lead",
+                    "uiName": "Lead session key event rate",
+                    "description": "Sessions with the named key event",
+                    "category": "Session",
+                    "type": "TYPE_FLOAT",
+                },
+            ],
+        }
+        captured = {}
+
+        def fake_request(token, method, url, params=None, payload=None, retries=2):
+            captured.update({"method": method, "url": url})
+            return response
+
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
+            self.module, "api_request", side_effect=fake_request
+        ), redirect_stdout(output), redirect_stderr(errors):
+            self.module.command_metadata(args)
+        self.assertEqual("GET", captured["method"])
+        self.assertTrue(captured["url"].endswith("properties/456/metadata"))
+        row = json.loads(output.getvalue())[0]
+        self.assertEqual("customEvent:lead_score", row["api_name"])
+        self.assertTrue(row["custom_definition"])
+        self.assertIn("truncated", errors.getvalue())
+
+    def test_compatibility_reports_candidate_fields_rather_than_a_verdict_on_the_request(self):
+        args = SimpleNamespace(
+            profile="example", property="456", dimensions="landingPage",
+            metrics="sessions,customEvent:lead_score", compatibility="all", limit=25, json=True,
+        )
+        captured = {}
+        response = {
+            "dimensionCompatibilities": [{
+                "dimensionMetadata": {
+                    "apiName": "landingPage", "uiName": "Landing page", "description": "Path"
+                },
+                "compatibility": "COMPATIBLE",
+            }],
+            "metricCompatibilities": [{
+                "metricMetadata": {
+                    "apiName": "customEvent:lead_score", "uiName": "Lead score",
+                    "description": "Custom score",
+                },
+                "compatibility": "INCOMPATIBLE",
+            }],
+        }
+
+        def fake_request(token, method, url, params=None, payload=None, retries=2):
+            captured.update({"method": method, "url": url, "payload": payload})
+            return response
+
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
+            self.module, "api_request", side_effect=fake_request
+        ), redirect_stdout(output), redirect_stderr(errors):
+            self.module.command_compatibility(args)
+        self.assertTrue(captured["url"].endswith("properties/456:checkCompatibility"))
+        self.assertEqual(
+            [{"name": "sessions"}, {"name": "customEvent:lead_score"}],
+            captured["payload"]["metrics"],
+        )
+        rows = json.loads(output.getvalue())
+        self.assertEqual("COMPATIBLE", rows[0]["compatibility"])
+        self.assertEqual("INCOMPATIBLE", rows[1]["compatibility"])
+        # Google's method "lists dimensions and metrics that can be added to a report request and
+        # maintain compatibility" and "fails if the request's dimensions and metrics are
+        # incompatible", so a table that arrived at all is not a pass mark on what was sent.
+        said = errors.getvalue()
+        self.assertIn("can be added to the supplied Core report context", said)
+        self.assertIn("not whether the supplied combination is valid", said)
+        self.assertIn("Realtime reports follow different compatibility rules", said)
+
+    def test_compatibility_filter_is_explicit_and_bounded(self):
+        args = SimpleNamespace(
+            profile="example", property="456", dimensions="date", metrics="sessions",
+            compatibility="compatible", limit=1, json=False,
+        )
+        captured = {}
+
+        def fake_request(token, method, url, params=None, payload=None, retries=2):
+            captured["payload"] = payload
+            return {"dimensionCompatibilities": [], "metricCompatibilities": []}
+
+        with patch.object(self.module, "selected_access", return_value=self.access), patch.object(
+            self.module, "api_request", side_effect=fake_request
+        ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.module.command_compatibility(args)
+        self.assertEqual("COMPATIBLE", captured["payload"]["compatibilityFilter"])
+
+    def helped(self, *argv):
+        """One credential-free `--help`, rewrapped to words because argparse wraps to the width."""
+        completed = subprocess.run(
+            [str(LAUNCHER), *argv, "--help"], cwd="/tmp",
+            env={"PATH": os.environ.get("PATH", "")}, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        return " ".join(completed.stdout.split())
+
+    def test_compatibility_help_claims_no_check_of_the_supplied_combination(self):
+        # **Both surfaces, because they carry different strings.** The subcommand listing shows the
+        # parser's `help`, and only the subcommand's own page shows its `description`; asserting one
+        # would leave the other free to keep promising a check of the supplied combination.
+        listing = self.helped()
+        self.assertIn("List Core report fields that can be added to the supplied", listing)
+        self.assertNotIn("can be combined", listing)
+        page = self.helped("compatibility")
+        self.assertIn("can be added to the supplied fields", page)
+        self.assertIn("the starting report context, not the thing being rated", page)
+        self.assertIn("Realtime reports have different rules", page)
+        self.assertNotIn("can be combined", page)
 
     def test_new_commands_reject_unbounded_limits_and_bad_properties(self):
         for limit in (0, -1, 10001):
@@ -652,7 +1040,7 @@ class ReportFamilyTest(unittest.TestCase):
     def test_csv_output_leads_with_the_requested_dimensions(self):
         _, output, _ = self.run_report(self.module.command_commerce, breakdown="brand", json=False)
         self.assertEqual(
-            "itemBrand,itemsViewed,itemsAddedToCart,itemsCheckedOut,itemsPurchased,itemRevenue,profile,property_id",
+            "itemBrand,itemsViewed,itemsAddedToCart,itemsCheckedOut,itemsPurchased,cartToViewRate,purchaseToViewRate,grossItemRevenue,itemRefundAmount,itemRevenue,profile,property_id",
             output.splitlines()[0],
         )
 
@@ -704,7 +1092,11 @@ class ReportFamilyTest(unittest.TestCase):
             ["traffic", "--property", "456"],
             ["audience", "--property", "456", "--breakdown", "age"],
             ["key-events", "--property", "456", "--event", "generate_lead"],
+            ["lead-lifecycle", "--property", "456"],
             ["commerce", "--property", "456", "--purchased-only"],
+            ["funnel", "--property", "456"],
+            ["metadata", "--property", "456"],
+            ["compatibility", "--property", "456"],
         ):
             with self.subTest(argv=argv[0]):
                 with patch.object(
@@ -730,7 +1122,7 @@ class ReportFamilyTest(unittest.TestCase):
         self.assertNotIn("Traceback", errors.getvalue())
 
     def test_new_subcommands_help_without_credentials(self):
-        for command in ("traffic", "audience", "key-events", "commerce"):
+        for command in ("traffic", "audience", "key-events", "lead-lifecycle", "commerce"):
             with self.subTest(command=command):
                 completed = subprocess.run(
                     [str(LAUNCHER), command, "--help"], cwd="/tmp",
@@ -738,6 +1130,15 @@ class ReportFamilyTest(unittest.TestCase):
                 )
                 self.assertEqual(0, completed.returncode, completed.stderr)
                 self.assertIn("--breakdown", completed.stdout)
+        for command in ("funnel", "metadata", "compatibility"):
+            with self.subTest(command=command):
+                completed = subprocess.run(
+                    [str(LAUNCHER), command, "--help"], cwd="/tmp",
+                    env={"PATH": os.environ.get("PATH", "")}, text=True,
+                    capture_output=True, check=False,
+                )
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                self.assertIn("--property", completed.stdout)
 
     def test_unknown_breakdown_values_are_rejected_by_the_parser(self):
         parser = self.module.build_parser()
